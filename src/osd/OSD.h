@@ -152,8 +152,11 @@ class DeletingState {
   } status;
   bool stop_deleting;
 public:
-  DeletingState() :
-    lock("DeletingState::lock"), status(QUEUED), stop_deleting(false) {}
+  const pg_t pgid;
+  const PGRef old_pg_state;
+  DeletingState(const pair<pg_t, PGRef> &in) :
+    lock("DeletingState::lock"), status(QUEUED), stop_deleting(false),
+    pgid(in.first), old_pg_state(in.second) {}
 
   /// check whether removal was canceled
   bool check_canceled() {
@@ -704,15 +707,19 @@ private:
     utime_t last_rx_back;   ///< last time we got a ping reply on the back side
     epoch_t epoch;      ///< most recent epoch we wanted this peer
 
-    bool is_healthy(utime_t cutoff) {
+    bool is_unhealthy(utime_t cutoff) {
       return
-	(last_rx_front > cutoff ||
-	 (last_rx_front == utime_t() && (last_tx == utime_t() ||
-					 first_tx > cutoff))) &&
-	(last_rx_back > cutoff ||
-	 (last_rx_back == utime_t() && (last_tx == utime_t() ||
-					first_tx > cutoff)));
+	! ((last_rx_front > cutoff ||
+	    (last_rx_front == utime_t() && (last_tx == utime_t() ||
+					    first_tx > cutoff))) &&
+	   (last_rx_back > cutoff ||
+	    (last_rx_back == utime_t() && (last_tx == utime_t() ||
+					   first_tx > cutoff))));
     }
+    bool is_healthy(utime_t cutoff) {
+      return last_rx_front > cutoff && last_rx_back > cutoff;
+    }
+
   };
   /// state attached to outgoing heartbeat connections
   struct HeartbeatSession : public RefCountedObject {
@@ -730,8 +737,10 @@ private:
   Messenger *hbclient_messenger;
   Messenger *hb_front_server_messenger;
   Messenger *hb_back_server_messenger;
+  utime_t last_heartbeat_resample;   ///< last time we chose random peers in waiting-for-healthy state
   
   void _add_heartbeat_peer(int p);
+  void _remove_heartbeat_peer(int p);
   bool heartbeat_reset(Connection *con);
   void maybe_update_heartbeat_peers();
   void reset_heartbeat_peers();
@@ -739,6 +748,11 @@ private:
   void heartbeat_check();
   void heartbeat_entry();
   void need_heartbeat_peer_update();
+
+  void heartbeat_kick() {
+    Mutex::Locker l(heartbeat_lock);
+    heartbeat_cond.Signal();
+  }
 
   struct T_Heartbeat : public Thread {
     OSD *osd;
@@ -1035,10 +1049,21 @@ protected:
   PG   *_open_lock_pg(OSDMapRef createmap,
 		      pg_t pg, bool no_lockdep_check=false,
 		      bool hold_map_lock=false);
+  enum res_result {
+    RES_PARENT,    // resurrected a parent
+    RES_SELF,      // resurrected self
+    RES_NONE       // nothing relevant deleting
+  };
+  res_result _try_resurrect_pg(
+    OSDMapRef curmap, pg_t pgid, pg_t *resurrected, PGRef *old_pg_state);
   PG   *_create_lock_pg(OSDMapRef createmap,
-			pg_t pgid, bool newly_created,
-			bool hold_map_lock, int role,
-			vector<int>& up, vector<int>& acting,
+			pg_t pgid,
+			bool newly_created,
+			bool hold_map_lock,
+			bool backfill,
+			int role,
+			vector<int>& up,
+			vector<int>& acting,
 			pg_history_t history,
 			pg_interval_map_t& pi,
 			ObjectStore::Transaction& t);
@@ -1048,10 +1073,12 @@ protected:
   void add_newly_split_pg(PG *pg,
 			  PG::RecoveryCtx *rctx);
 
-  PG *get_or_create_pg(const pg_info_t& info,
-                       pg_interval_map_t& pi,
-                       epoch_t epoch, int from, int& pcreated,
-                       bool primary);
+  void handle_pg_peering_evt(
+    const pg_info_t& info,
+    pg_interval_map_t& pi,
+    epoch_t epoch, int from,
+    bool primary,
+    PG::CephPeeringEvtRef evt);
   
   void load_pgs();
   void build_past_intervals_parallel();
@@ -1116,6 +1143,9 @@ protected:
   void start_boot();
   void _maybe_boot(epoch_t oldest, epoch_t newest);
   void _send_boot();
+
+  void start_waiting_for_healthy();
+  bool _is_healthy();
   
   friend class C_OSD_GetVersion;
 

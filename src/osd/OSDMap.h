@@ -203,6 +203,7 @@ private:
 
   epoch_t cluster_snapshot_epoch;
   string cluster_snapshot;
+  bool new_blacklist_entries;
 
  public:
   std::tr1::shared_ptr<CrushWrapper> crush;       // hierarchical map
@@ -220,6 +221,7 @@ private:
 	     pg_temp(new map<pg_t,vector<int> >),
 	     osd_uuid(new vector<uuid_d>),
 	     cluster_snapshot_epoch(0),
+	     new_blacklist_entries(false),
 	     crush(new CrushWrapper) {
     memset(&fsid, 0, sizeof(fsid));
   }
@@ -238,6 +240,7 @@ private:
   const utime_t& get_modified() const { return modified; }
 
   bool is_blacklisted(const entity_addr_t& a) const;
+  void get_blacklist(list<pair<entity_addr_t,utime_t > > *bl) const;
 
   string get_cluster_snapshot() const {
     if (cluster_snapshot_epoch == epoch)
@@ -401,6 +404,30 @@ private:
     for (int i=0; i<max_osd; i++)
       if (is_up(i))
 	return i;
+    return -1;
+  }
+
+  int get_next_up_osd_after(int n) const {
+    for (int i = n + 1; i != n; ++i) {
+      if (i >= get_max_osd())
+	i = 0;
+      if (i == n)
+	break;
+      if (is_up(i))
+	return i;
+    }
+    return -1;
+  }
+
+  int get_previous_up_osd_before(int n) const {
+    for (int i = n - 1; i != n; --i) {
+      if (i < 0)
+	i = get_max_osd() - 1;
+      if (i == n)
+	break;
+      if (is_up(i))
+	return i;
+    }
     return -1;
   }
 
@@ -585,6 +612,7 @@ public:
   void dump_json(ostream& out) const;
   void dump(Formatter *f) const;
   static void generate_test_instances(list<OSDMap*>& o);
+  bool check_new_blacklist_entries() const { return new_blacklist_entries; }
 };
 WRITE_CLASS_ENCODER_FEATURES(OSDMap)
 WRITE_CLASS_ENCODER_FEATURES(OSDMap::Incremental)

@@ -357,7 +357,10 @@ librados_SOURCES = \
 	librados/RadosClient.cc \
 	librados/IoCtxImpl.cc \
 	osdc/Objecter.cc \
-	osdc/Striper.cc
+	osdc/Striper.cc \
+	cls/lock/cls_lock_client.cc \
+	cls/lock/cls_lock_types.cc \
+	cls/lock/cls_lock_ops.cc
 librados_la_SOURCES = ${librados_SOURCES}
 librados_la_CFLAGS = ${CRYPTO_CFLAGS} ${AM_CFLAGS}
 librados_la_CXXFLAGS = ${AM_CXXFLAGS}
@@ -736,6 +739,15 @@ unittest_osd_types_CXXFLAGS = ${AM_CXXFLAGS} ${UNITTEST_CXXFLAGS}
 unittest_osd_types_LDADD = libglobal.la libcommon.la $(PTHREAD_LIBS) -lm ${UNITTEST_LDADD} $(CRYPTO_LIBS) $(EXTRALIBS)
 check_PROGRAMS += unittest_osd_types
 
+unittest_pglog_SOURCES = test/osd/TestPGLog.cc objclass/class_api.cc perfglue/disabled_heap_profiler.cc
+unittest_pglog_CXXFLAGS = ${AM_CXXFLAGS} ${UNITTEST_CXXFLAGS}
+unittest_pglog_LDADD =  libosd.a $(LIBOS_LDA) $(LIBGLOBAL_LDA) ${UNITTEST_LDADD} 
+check_PROGRAMS += unittest_pglog
+
+if LINUX
+unittest_pglog_LDADD += -ldl
+endif
+
 unittest_gather_SOURCES = test/gather.cc
 unittest_gather_LDADD = ${LIBGLOBAL_LDA} ${UNITTEST_LDADD}
 unittest_gather_CXXFLAGS = ${AM_CXXFLAGS} ${UNITTEST_CXXFLAGS}
@@ -1011,6 +1023,12 @@ ceph_test_rados_api_misc_LDFLAGS = ${AM_LDFLAGS}
 ceph_test_rados_api_misc_LDADD =  librados.la ${UNITTEST_STATIC_LDADD}
 ceph_test_rados_api_misc_CXXFLAGS = ${AM_CXXFLAGS} ${UNITTEST_CXXFLAGS}
 bin_DEBUGPROGRAMS += ceph_test_rados_api_misc
+
+ceph_test_rados_api_lock_SOURCES = test/librados/lock.cc test/librados/test.cc
+ceph_test_rados_api_lock_LDFLAGS = ${AM_LDFLAGS}
+ceph_test_rados_api_lock_LDADD =  librados.la ${UNITTEST_STATIC_LDADD}
+ceph_test_rados_api_lock_CXXFLAGS = ${AM_CXXFLAGS} ${UNITTEST_CXXFLAGS}
+bin_DEBUGPROGRAMS += ceph_test_rados_api_lock
 
 ceph_test_libcephfs_SOURCES = test/libcephfs/test.cc test/libcephfs/readdir_r_cb.cc test/libcephfs/caps.cc
 ceph_test_libcephfs_LDFLAGS = $(PTHREAD_CFLAGS) ${AM_LDFLAGS}
@@ -1490,12 +1508,14 @@ libos_a_SOURCES = \
 	os/IndexManager.cc \
 	os/FlatIndex.cc \
 	os/DBObjectMap.cc \
-	os/LevelDBStore.cc
+	os/LevelDBStore.cc \
+	os/WBThrottle.cc
 libos_a_CXXFLAGS= ${AM_CXXFLAGS}
 noinst_LIBRARIES += libos.a
 
 libosd_a_SOURCES = \
 	osd/PG.cc \
+	osd/PGLog.cc \
 	osd/ReplicatedPG.cc \
 	osd/Ager.cc \
 	osd/OSD.cc \
@@ -1873,6 +1893,8 @@ noinst_HEADERS = \
 	messages/MMDSFindInoReply.h\
         messages/MMDSFragmentNotify.h\
         messages/MMDSMap.h\
+	messages/MMDSOpenIno.h \
+	messages/MMDSOpenInoReply.h \
         messages/MMDSResolve.h\
         messages/MMDSResolveAck.h\
         messages/MMDSSlaveRequest.h\
@@ -1973,6 +1995,8 @@ noinst_HEADERS = \
         os/FileStore.h\
 	os/FlatIndex.h\
 	os/HashIndex.h\
+	os/FDCache.h\
+	os/WBThrottle.h\
 	os/IndexManager.h\
         os/Journal.h\
         os/JournalingObjectStore.h\
@@ -1988,6 +2012,7 @@ noinst_HEADERS = \
 	osd/OpRequest.h\
 	osd/SnapMapper.h\
         osd/PG.h\
+        osd/PGLog.h\
         osd/ReplicatedPG.h\
         osd/Watch.h\
         osd/osd_types.h\
