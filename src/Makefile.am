@@ -1305,6 +1305,21 @@ ceph_ver.c: ./ceph_ver.h
 common/version.cc: ./ceph_ver.h
 test/encoding/ceph_dencoder.cc: ./ceph_ver.h
 
+# assemble Python script with global version variables
+# NB: depends on format of ceph_ver.h
+
+ceph: ceph.in ./ceph_ver.h Makefile
+	rm -f $@ $@.tmp
+	echo "#!/usr/bin/python" >$@.tmp
+	grep "#define CEPH_GIT_NICE_VER" ./ceph_ver.h | \
+		sed -e 's/#define \(.*VER\) /\1=/' >>$@.tmp
+	grep "#define CEPH_GIT_VER" ./ceph_ver.h | \
+	  sed -e 's/#define \(.*VER\) /\1=/' -e 's/=\(.*\)$$/="\1"/' >>$@.tmp
+	cat $@.in >>$@.tmp
+	chmod a+x $@.tmp
+	chmod a-w $@.tmp
+	mv $@.tmp $@
+
 # cleaning
 clean-local:
 	-rm *.so *.gcno *.gcda
