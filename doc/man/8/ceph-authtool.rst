@@ -1,3 +1,5 @@
+:orphan:
+
 =================================================
  ceph-authtool -- ceph keyring manipulation tool
 =================================================
@@ -7,9 +9,18 @@
 Synopsis
 ========
 
-| **ceph-authtool** *keyringfile* [ -l | --list ] [ -C | --create-keyring
-  ] [ -p | --print ] [ -n | --name *entityname* ] [ --gen-key ] [ -a |
-  --add-key *base64_key* ] [ --caps *capfils* ]
+| **ceph-authtool** *keyringfile*
+  [ -l | --list ]
+  [ -p | --print-key ]
+  [ -C | --create-keyring ]
+  [ -g | --gen-key ]
+  [ --gen-print-key ]
+  [ --import-keyring *otherkeyringfile* ]
+  [ -n | --name *entityname* ]
+  [ -a | --add-key *base64_key* ]
+  [ --cap *subsystem* *capability* ]
+  [ --caps *capfile* ]
+  [ --mode *mode* ]
 
 
 Description
@@ -24,7 +35,7 @@ associated with an entity name, of the form
 **WARNING** Ceph provides authentication and protection against
 man-in-the-middle attacks once secret keys are in place.  However,
 data over the wire is not encrypted, which may include the messages
-used to configure said keys.  The system is primarily intended to be
+used to configure said keys. The system is primarily intended to be
 used in trusted environments.
 
 Options
@@ -34,7 +45,7 @@ Options
 
    will list all keys and capabilities present in the keyring
 
-.. option:: -p, --print
+.. option:: -p, --print-key
 
    will print an encoded key for the specified entityname. This is
    suitable for the ``mount -o secret=`` argument
@@ -43,21 +54,38 @@ Options
 
    will create a new keyring, overwriting any existing keyringfile
 
-.. option:: --gen-key
+.. option:: -g, --gen-key
 
    will generate a new secret key for the specified entityname
 
-.. option:: --add-key
+.. option:: --gen-print-key
+
+   will generate a new secret key for the specified entityname,
+   without altering the keyringfile, printing the secret to stdout
+
+.. option:: --import-keyring *secondkeyringfile*
+
+   will import the content of a given keyring to the keyringfile
+
+.. option:: -n, --name *name*
+
+   specify entityname to operate on
+
+.. option:: -a, --add-key *base64_key*
 
    will add an encoded key to the keyring
 
-.. option:: --cap subsystem capability
+.. option:: --cap *subsystem* *capability*
 
    will set the capability for given subsystem
 
-.. option:: --caps capsfile
+.. option:: --caps *capsfile*
 
    will set all of capabilities associated with a given key, for all subsystems
+
+ .. option:: --mode *mode*
+
+    will set the desired file mode to the keyring e.g: 0644, defaults to 0600
 
 
 Capabilities
@@ -111,7 +139,9 @@ In general, an osd capability follows the grammar::
 
         osdcap  := grant[,grant...]
         grant   := allow (match capspec | capspec match)
-        match   := [pool[=]<poolname> | object_prefix <prefix>]
+        match   := [ pool[=]<poolname> | object_prefix <prefix>
+                    | namespace[=]<rados-namespace>
+                    | tag <application-name> <key>=<value> ]
         capspec := * | [r][w][x] [class-read] [class-write]
 
 The capspec determines what kind of operations the entity can perform::
@@ -121,7 +151,7 @@ The capspec determines what kind of operations the entity can perform::
     x           = can call any class method (same as class-read class-write)
     class-read  = can call class methods that are reads
     class-write = can call class methods that are writes
-    *           = equivalent to rwx, plus the ability to run osd admin commands,
+    * or "all"  = equivalent to rwx, plus the ability to run osd admin commands,
                   i.e. ceph osd tell ...
 
 The match criteria restrict a grant based on the pool being accessed.
@@ -144,12 +174,12 @@ value is the capability string (see above).
 Example
 =======
 
-To create a new keyring containing a key for client.foo::
+To create a new keyring containing a key for client.foo with a 0644 file mode::
 
-        ceph-authtool -C -n client.foo --gen-key keyring
+        ceph-authtool -C -n client.foo --gen-key keyring --mode 0644
 
 To associate some capabilities with the key (namely, the ability to
-mount a Ceph filesystem)::
+mount a Ceph file system)::
 
         ceph-authtool -n client.foo --cap mds 'allow' --cap osd 'allow rw pool=data' --cap mon 'allow r' keyring
 
@@ -157,7 +187,7 @@ To display the contents of the keyring::
 
         ceph-authtool -l keyring
 
-When mount a Ceph file system, you can grab the appropriately encoded secret key with::
+When mounting a Ceph file system, you can grab the appropriately encoded secret key with::
 
         mount -t ceph serverhost:/ mountpoint -o name=foo,secret=`ceph-authtool -p -n client.foo keyring`
 
@@ -165,7 +195,7 @@ When mount a Ceph file system, you can grab the appropriately encoded secret key
 Availability
 ============
 
-**ceph-authtool** is part of the Ceph distributed file system. Please
+**ceph-authtool** is part of Ceph, a massively scalable, open-source, distributed storage system. Please
 refer to the Ceph documentation at http://ceph.com/docs for more
 information.
 

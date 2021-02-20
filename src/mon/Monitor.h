@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -7,53 +7,59 @@
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software 
+ * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- * 
+ *
  */
 
-/* 
- * This is the top level monitor. It runs on each machine in the Monitor   
- * Cluster. The election of a leader for the paxos algorithm only happens 
- * once per machine via the elector. There is a separate paxos instance (state) 
- * kept for each of the system components: Object Store Device (OSD) Monitor, 
+/*
+ * This is the top level monitor. It runs on each machine in the Monitor
+ * Cluster. The election of a leader for the paxos algorithm only happens
+ * once per machine via the elector. There is a separate paxos instance (state)
+ * kept for each of the system components: Object Store Device (OSD) Monitor,
  * Placement Group (PG) Monitor, Metadata Server (MDS) Monitor, and Client Monitor.
  */
 
 #ifndef CEPH_MONITOR_H
 #define CEPH_MONITOR_H
 
+#include <errno.h>
+#include <cmath>
+#include <string>
+#include <array>
+
 #include "include/types.h"
+#include "include/health.h"
 #include "msg/Messenger.h"
 
 #include "common/Timer.h"
 
+#include "health_check.h"
 #include "MonMap.h"
 #include "Elector.h"
 #include "Paxos.h"
 #include "Session.h"
+#include "MonCommand.h"
 
-#include "osd/OSDMap.h"
 
+#include "common/config_obs.h"
 #include "common/LogClient.h"
-#include "common/SimpleRNG.h"
-
+#include "auth/AuthClient.h"
+#include "auth/AuthServer.h"
 #include "auth/cephx/CephxKeyServer.h"
 #include "auth/AuthMethodList.h"
 #include "auth/KeyRing.h"
-
-#include "perfglue/heap_profiler.h"
-
+#include "include/common_fwd.h"
 #include "messages/MMonCommand.h"
-#include "mon/MonitorStore.h"
 #include "mon/MonitorDBStore.h"
+#include "mgr/MgrClient.h"
 
-#include <memory>
-#include <tr1/memory>
-#include <errno.h>
+#include "mon/MonOpRequest.h"
+#include "common/WorkQueue.h"
 
+using namespace TOPNSPC::common;
 
-#define CEPH_MON_PROTOCOL     10 /* cluster internal */
+#define CEPH_MON_PROTOCOL     13 /* cluster internal */
 
 
 enum {
@@ -64,9 +70,9 @@ enum {
   l_cluster_num_osd_up,
   l_cluster_num_osd_in,
   l_cluster_osd_epoch,
-  l_cluster_osd_kb,
-  l_cluster_osd_kb_used,
-  l_cluster_osd_kb_avail,
+  l_cluster_osd_bytes,
+  l_cluster_osd_bytes_used,
+  l_cluster_osd_bytes_avail,
   l_cluster_num_pool,
   l_cluster_num_pg,
   l_cluster_num_pg_active_clean,
@@ -74,43 +80,52 @@ enum {
   l_cluster_num_pg_peering,
   l_cluster_num_object,
   l_cluster_num_object_degraded,
+  l_cluster_num_object_misplaced,
   l_cluster_num_object_unfound,
   l_cluster_num_bytes,
-  l_cluster_num_mds_up,
-  l_cluster_num_mds_in,
-  l_cluster_num_mds_failed,
-  l_cluster_mds_epoch,
   l_cluster_last,
 };
 
-class QuorumService;
+enum {
+  l_mon_first = 456000,
+  l_mon_num_sessions,
+  l_mon_session_add,
+  l_mon_session_rm,
+  l_mon_session_trim,
+  l_mon_num_elections,
+  l_mon_election_call,
+  l_mon_election_win,
+  l_mon_election_lose,
+  l_mon_last,
+};
+
+class ConfigKeyService;
 class PaxosService;
 
-class PerfCounters;
 class AdminSocketHook;
-
-class MMonGetMap;
-class MMonGetVersion;
-class MMonSync;
-class MMonProbe;
-class MMonSubscribe;
-class MAuthRotating;
-class MRoute;
-class MForward;
-class MTimeCheck;
-class MMonHealth;
 
 #define COMPAT_SET_LOC "feature_set"
 
-class Monitor : public Dispatcher {
+class Monitor : public Dispatcher,
+		public AuthClient,
+		public AuthServer,
+                public md_config_obs_t {
 public:
+  int orig_argc = 0;
+  const char **orig_argv = nullptr;
+
   // me
-  string name;
+  std::string name;
   int rank;
   Messenger *messenger;
-  Mutex lock;
+  ConnectionRef con_self;
+  ceph::mutex lock = ceph::make_mutex("Monitor::lock");
   SafeTimer timer;
-  
+  Finisher finisher;
+  ThreadPool cpu_tp;  ///< threadpool for CPU intensive work
+
+  ceph::mutex auth_lock = ceph::make_mutex("Monitor::auth_lock");
+
   /// true if we have ever joined a quorum.  if false, we are either a
   /// new cluster, a newly joining monitor, or a just-upgraded
   /// monitor.
@@ -123,10 +138,13 @@ public:
   void unregister_cluster_logger();
 
   MonMap *monmap;
+  uuid_d fingerprint;
 
-  set<entity_addr_t> extra_probe_peers;
+  std::set<entity_addrvec_t> extra_probe_peers;
 
-  LogClient clog;
+  LogClient log_client;
+  LogChannelRef clog;
+  LogChannelRef audit_clog;
   KeyRing keyring;
   KeyServer key_server;
 
@@ -135,27 +153,39 @@ public:
 
   CompatSet features;
 
+  std::vector<MonCommand> leader_mon_commands; // quorum leader's commands
+  std::vector<MonCommand> local_mon_commands;  // commands i support
+  ceph::buffer::list local_mon_commands_bl;       // encoded version of above
+
+  std::vector<MonCommand> prenautilus_local_mon_commands;
+  ceph::buffer::list prenautilus_local_mon_commands_bl;
+
+  Messenger *mgr_messenger;
+  MgrClient mgr_client;
+  uint64_t mgr_proxy_bytes = 0;  // in-flight proxied mgr command message bytes
+  std::string gss_ktfile_client{};
+
 private:
   void new_tick();
-  friend class C_Mon_Tick;
 
   // -- local storage --
 public:
   MonitorDBStore *store;
-  static const string MONITOR_NAME;
-  static const string MONITOR_STORE_PREFIX;
+  static const std::string MONITOR_NAME;
+  static const std::string MONITOR_STORE_PREFIX;
 
   // -- monitor state --
 private:
   enum {
-    STATE_PROBING = 1,
+    STATE_INIT = 1,
+    STATE_PROBING,
     STATE_SYNCHRONIZING,
     STATE_ELECTING,
     STATE_LEADER,
     STATE_PEON,
     STATE_SHUTDOWN
   };
-  int state;
+  int state = STATE_INIT;
 
 public:
   static const char *get_state_name(int s) {
@@ -165,16 +195,16 @@ public:
     case STATE_ELECTING: return "electing";
     case STATE_LEADER: return "leader";
     case STATE_PEON: return "peon";
+    case STATE_SHUTDOWN: return "shutdown";
     default: return "???";
     }
   }
-  const string get_state_name() const {
-    string sn(get_state_name(state));
-    string sync_name(get_sync_state_name());
-    sn.append(sync_name);
-    return sn;
+  const char *get_state_name() const {
+    return get_state_name(state);
   }
 
+  bool is_init() const { return state == STATE_INIT; }
+  bool is_shutdown() const { return state == STATE_SHUTDOWN; }
   bool is_probing() const { return state == STATE_PROBING; }
   bool is_synchronizing() const { return state == STATE_SYNCHRONIZING; }
   bool is_electing() const { return state == STATE_ELECTING; }
@@ -183,24 +213,171 @@ public:
 
   const utime_t &get_leader_since() const;
 
+  void prepare_new_fingerprint(MonitorDBStore::TransactionRef t);
+
+  std::vector<DaemonHealthMetric> get_health_metrics();
+
   // -- elector --
 private:
-  Paxos *paxos;
+  std::unique_ptr<Paxos> paxos;
   Elector elector;
   friend class Elector;
+
+  /// features we require of peers (based on on-disk compatset)
+  uint64_t required_features;
   
   int leader;            // current leader (to best of knowledge)
-  set<int> quorum;       // current active set of monitors (if !starting)
+  std::set<int> quorum;       // current active set of monitors (if !starting)
+  ceph::mono_clock::time_point quorum_since;  // when quorum formed
   utime_t leader_since;  // when this monitor became the leader, if it is the leader
   utime_t exited_quorum; // time detected as not in quorum; 0 if in
-  uint64_t quorum_features;  ///< intersection of quorum member feature bits
 
-  set<string> outside_quorum;
+  // map of counts of connected clients, by type and features, for
+  // each quorum mon
+  std::map<int,FeatureMap> quorum_feature_map;
 
   /**
-   * @defgroup Synchronization
+   * Intersection of quorum member's connection feature bits.
+   */
+  uint64_t quorum_con_features;
+  /**
+   * Intersection of quorum members mon-specific feature bits
+   */
+  mon_feature_t quorum_mon_features;
+
+  ceph_release_t quorum_min_mon_release{ceph_release_t::unknown};
+
+  std::set<std::string> outside_quorum;
+
+  bool stretch_mode_engaged{false};
+  bool degraded_stretch_mode{false};
+  bool recovering_stretch_mode{false};
+  string stretch_bucket_divider;
+  map<string, set<string>> dead_mon_buckets; // bucket->mon ranks, locations with no live mons
+  set<string> up_mon_buckets; // locations with a live mon
+  void do_stretch_mode_election_work();
+
+  bool session_stretch_allowed(MonSession *s, MonOpRequestRef& op);
+  void disconnect_disallowed_stretch_sessions();
+  void set_elector_disallowed_leaders(bool allow_election);
+public:
+  bool is_stretch_mode() { return stretch_mode_engaged; }
+  bool is_degraded_stretch_mode() { return degraded_stretch_mode; }
+  bool is_recovering_stretch_mode() { return recovering_stretch_mode; }
+  void maybe_engage_stretch_mode();
+  void maybe_go_degraded_stretch_mode();
+  void trigger_degraded_stretch_mode(const set<string>& dead_mons,
+				     const set<int>& dead_buckets);
+  void set_degraded_stretch_mode();
+  void go_recovery_stretch_mode();
+  void trigger_healthy_stretch_mode();
+  void set_healthy_stretch_mode();
+  void enable_stretch_mode();
+
+  
+private:
+
+  /**
+   * @defgroup Monitor_h_scrub
    * @{
    */
+  version_t scrub_version;            ///< paxos version we are scrubbing
+  std::map<int,ScrubResult> scrub_result;  ///< results so far
+
+  /**
+   * trigger a cross-mon scrub
+   *
+   * Verify all mons are storing identical content
+   */
+  int scrub_start();
+  int scrub();
+  void handle_scrub(MonOpRequestRef op);
+  bool _scrub(ScrubResult *r,
+              std::pair<std::string,std::string> *start,
+              int *num_keys);
+  void scrub_check_results();
+  void scrub_timeout();
+  void scrub_finish();
+  void scrub_reset();
+  void scrub_update_interval(ceph::timespan interval);
+
+  Context *scrub_event;       ///< periodic event to trigger scrub (leader)
+  Context *scrub_timeout_event;  ///< scrub round timeout (leader)
+  void scrub_event_start();
+  void scrub_event_cancel();
+  void scrub_reset_timeout();
+  void scrub_cancel_timeout();
+
+  struct ScrubState {
+    std::pair<std::string,std::string> last_key; ///< last scrubbed key
+    bool finished;
+
+    ScrubState() : finished(false) { }
+    virtual ~ScrubState() { }
+  };
+  std::shared_ptr<ScrubState> scrub_state; ///< keeps track of current scrub
+
+  /**
+   * @defgroup Monitor_h_sync Synchronization
+   * @{
+   */
+  /**
+   * @} // provider state
+   */
+  struct SyncProvider {
+    entity_addrvec_t addrs;
+    uint64_t cookie;       ///< unique cookie for this sync attempt
+    utime_t timeout;       ///< when we give up and expire this attempt
+    version_t last_committed; ///< last paxos version on peer
+    std::pair<std::string,std::string> last_key; ///< last key sent to (or on) peer
+    bool full;             ///< full scan?
+    MonitorDBStore::Synchronizer synchronizer;   ///< iterator
+
+    SyncProvider() : cookie(0), last_committed(0), full(false) {}
+
+    void reset_timeout(CephContext *cct, int grace) {
+      timeout = ceph_clock_now();
+      timeout += grace;
+    }
+  };
+
+  std::map<std::uint64_t, SyncProvider> sync_providers;  ///< cookie -> SyncProvider for those syncing from us
+  uint64_t sync_provider_count;   ///< counter for issued cookies to keep them unique
+
+  /**
+   * @} // requester state
+   */
+  entity_addrvec_t sync_provider;  ///< who we are syncing from
+  uint64_t sync_cookie;          ///< 0 if we are starting, non-zero otherwise
+  bool sync_full;                ///< true if we are a full sync, false for recent catch-up
+  version_t sync_start_version;  ///< last_committed at sync start
+  Context *sync_timeout_event;   ///< timeout event
+
+  /**
+   * floor for sync source
+   *
+   * When we sync we forget about our old last_committed value which
+   * can be dangerous.  For example, if we have a cluster of:
+   *
+   *   mon.a: lc 100
+   *   mon.b: lc 80
+   *   mon.c: lc 100 (us)
+   *
+   * If something forces us to sync (say, corruption, or manual
+   * intervention, or bug), we forget last_committed, and might abort.
+   * If mon.a happens to be down when we come back, we will see:
+   *
+   *   mon.b: lc 80
+   *   mon.c: lc 0 (us)
+   *
+   * and sync from mon.b, at which point a+b will both have lc 80 and
+   * come online with a majority holding out of date commits.
+   *
+   * Avoid this by preserving our old last_committed value prior to
+   * sync and never going backwards.
+   */
+  version_t sync_last_committed_floor;
+
   /**
    * Obtain the synchronization target prefixes in set form.
    *
@@ -214,872 +391,105 @@ private:
    *
    * @returns a set of strings referring to the prefixes being synchronized
    */
-  set<string> get_sync_targets_names();
-  /**
-   * Handle a sync-related message
-   *
-   * This function will call the appropriate handling functions for each
-   * operation type.
-   *
-   * @param m A sync-related message (i.e., of type MMonSync)
-   */
-  void handle_sync(MMonSync *m);
-  /**
-   * Handle a sync-related message of operation type OP_ABORT.
-   *
-   * @param m A sync-related message of type OP_ABORT
-   */
-  void handle_sync_abort(MMonSync *m);
-  /**
-   * Reset the monitor's sync-related data structures and state.
-   */
-  void reset_sync(bool abort = false);
+  std::set<std::string> get_sync_targets_names();
 
   /**
-   * @defgroup Synchronization_Roles
-   * @{
+   * Reset the monitor's sync-related data structures for syncing *from* a peer
    */
-  /**
-   * The monitor has no role in any on-going synchronization.
-   */
-  static const uint8_t SYNC_ROLE_NONE	    = 0x0;
-  /**
-   * The monitor is the Leader in at least one synchronization.
-   */
-  static const uint8_t SYNC_ROLE_LEADER	    = 0x1;
-  /**
-   * The monitor is the Provider in at least one synchronization.
-   */
-  static const uint8_t SYNC_ROLE_PROVIDER   = 0x2;
-  /**
-   * The monitor is a requester in the on-going synchronization.
-   */
-  static const uint8_t SYNC_ROLE_REQUESTER  = 0x4;
+  void sync_reset_requester();
 
   /**
-   * The monitor's current role in on-going synchronizations, if any.
-   *
-   * A monitor can either be part of no synchronization at all, in which case
-   * @p sync_role shall hold the value @p SYNC_ROLE_NONE, or it can be part of
-   * an on-going synchronization, in which case it may be playing either one or
-   * two roles at the same time:
-   *
-   *  - If the monitor is the sync requester (i.e., be the one synchronizing
-   *    against some other monitor), the @p sync_role field will hold only the
-   *    @p SYNC_ROLE_REQUESTER value.
-   *  - Otherwise, the monitor can be either a sync leader, or a sync provider,
-   *    or both, in which case @p sync_role will hold a binary OR of both
-   *    @p SYNC_ROLE_LEADER and @p SYNC_ROLE_PROVIDER.
+   * Reset sync state related to allowing others to sync from us
    */
-  uint8_t sync_role;
-  /**
-   * @}
-   */
-  /**
-   * @defgroup Leader-specific
-   * @{
-   */
-  /**
-   * Guarantee mutual exclusion access to the @p trim_timeouts map.
-   *
-   * We need this mutex specially when we have a monitor starting a sync with
-   * the leader and another one finishing or aborting an on-going sync, that
-   * happens to be the last on-going trim on the map. Given that we will
-   * enable the Paxos trim once we deplete the @p trim_timeouts map, we must
-   * then ensure that we either add the new sync start to the map before
-   * removing the one just finishing, or that we remove the finishing one
-   * first and enable the trim before we add the new one. If we fail to do
-   * this, nasty repercussions could follow.
-   */
-  Mutex trim_lock;
-  /**
-   * Map holding all on-going syncs' timeouts.
-   *
-   * An on-going sync leads to the Paxos trim to be suspended, and this map
-   * will associate entities to the timeouts to be triggered if the monitor
-   * being synchronized fails to check-in with the leader, letting him know
-   * that the sync is still in effect and that in no circumstances should the
-   * Paxos trim be enabled.
-   */
-  map<entity_inst_t, Context*> trim_timeouts;
-  map<entity_inst_t, uint8_t> trim_entities_states;
-  /**
-   * Map associating monitors to a sync state.
-   *
-   * This map is used by both the Leader and the Sync Provider, and has the
-   * sole objective of keeping track of the state each monitor's sync process
-   * is in.
-   */
-  map<entity_inst_t, uint8_t> sync_entities_states;
-  /**
-   * Timer that will enable the Paxos trim.
-   *
-   * This timer is set after the @p trim_timeouts map is depleted, and once
-   * fired it will enable the Paxos trim (if still disabled). By setting
-   * this timer, we avoid a scenario in which a monitor has just finished
-   * synchronizing, but because the Paxos trim had been disabled for a long,
-   * long time and a lot of trims were proposed in the timespan of the monitor
-   * finishing its sync and actually joining the cluster, the monitor happens
-   * to be out-of-sync yet again. Backing off enabling the Paxos trim will
-   * allow the other monitor to join the cluster before actually trimming.
-   */
-  Context *trim_enable_timer;
+  void sync_reset_provider();
 
   /**
-   * Callback class responsible for finishing a monitor's sync session on the
-   * leader's side, because the said monitor failed to acknowledge its
-   * liveliness in a timely manner, thus being assumed as failed.
+   * Caled when a sync attempt times out (requester-side)
    */
-  struct C_TrimTimeout : public Context {
-    Monitor *mon;
-    entity_inst_t entity;
-
-    C_TrimTimeout(Monitor *m, entity_inst_t& entity)
-      : mon(m), entity(entity) { }
-    void finish(int r) {
-      mon->sync_finish(entity);
-    }
-  };
+  void sync_timeout();
 
   /**
-   * Callback class responsible for enabling the Paxos trim if there are no
-   * more on-going syncs.
+   * Get the latest monmap for backup purposes during sync
    */
-  struct C_TrimEnable : public Context {
-    Monitor *mon;
-
-    C_TrimEnable(Monitor *m) : mon(m) { }
-    void finish(int r) {
-      Mutex::Locker(mon->trim_lock);
-      // even if we are no longer the leader, we should re-enable trim if
-      // we have disabled it in the past. It doesn't mean we are going to
-      // do anything about it, but if we happen to become the leader
-      // sometime down the future, we sure want to have the trim enabled.
-      if (mon->trim_timeouts.empty())
-	mon->paxos->trim_enable();
-      mon->trim_enable_timer = NULL;
-    }
-  };
-
-  void sync_store_init();
-  void sync_store_cleanup();
-  bool is_sync_on_going();
+  void sync_obtain_latest_monmap(ceph::buffer::list &bl);
 
   /**
-   * Send a heartbeat message to another entity.
+   * Start sync process
    *
-   * The sent message may be a heartbeat reply if the @p reply parameter is
-   * set to true.
+   * Start pulling committed state from another monitor.
    *
-   * This function is used both by the leader (always with @p reply = true),
-   * and by the sync requester (always with @p reply = false).
-   *
-   * @param other The target monitor's entity instance.
-   * @param reply Whether the message to be sent should be a heartbeat reply.
+   * @param entity where to pull committed state from
+   * @param full whether to do a full sync or just catch up on recent paxos
    */
-  void sync_send_heartbeat(entity_inst_t &other, bool reply = false);
-  /**
-   * Handle a Sync Start request.
-   *
-   * Monitors wanting to synchronize with the cluster will have to first ask
-   * the leader to do so. The only objective with this is so that the we can
-   * gurantee that the leader won't trim the paxos state.
-   *
-   * The leader may not be the only one receiving this request. A sync provider
-   * may also receive it when it is taken as the point of entry onto the
-   * cluster. In this scenario, the provider must then forward this request to
-   * the leader, if he know of one, or assume himself as the leader for this
-   * sync purpose (this may happen if there is no formed quorum).
-   *
-   * @param m Sync message with operation type MMonSync::OP_START
-   */
-  void handle_sync_start(MMonSync *m);
-  /**
-   * Handle a Heartbeat sent by a sync requester.
-   *
-   * We use heartbeats as a way to guarantee that both the leader and the sync
-   * requester are still alive. Receiving this message means that the requester
-   * if still working on getting his store synchronized.
-   *
-   * @param m Sync message with operation type MMonSync::OP_HEARTBEAT
-   */
-  void handle_sync_heartbeat(MMonSync *m);
-  /**
-   * Handle a Sync Finish.
-   *
-   * A MMonSync::OP_FINISH is the way the sync requester has to inform the
-   * leader that he finished synchronizing his store.
-   *
-   * @param m Sync message with operation type MMonSync::OP_FINISH
-   */
-  void handle_sync_finish(MMonSync *m);
-  /**
-   * Finish a given monitor's sync process on the leader's side.
-   *
-   * This means cleaning up the state referring to the monitor whose sync has
-   * finished (may it have been finished successfully, by receiving a message
-   * with type MMonSync::OP_FINISH, or due to the assumption that the said
-   * monitor failed).
-   *
-   * If we happen to know of no other monitor synchronizing, we may then enable
-   * the paxos trim.
-   *
-   * @param entity Entity instance of the monitor whose sync we are considering
-   *		   as finished.
-   * @param abort If true, we consider this sync has finished due to an abort.
-   */
-  void sync_finish(entity_inst_t &entity, bool abort = false);
-  /**
-   * Abort a given monitor's sync process on the leader's side.
-   *
-   * This function is a wrapper for Monitor::sync_finish().
-   *
-   * @param entity Entity instance of the monitor whose sync we are aborting.
-   */
-  void sync_finish_abort(entity_inst_t &entity) {
-    sync_finish(entity, true);
-  }
-  /**
-   * @} // Leader-specific
-   */
-  /**
-   * @defgroup Synchronization Provider-specific
-   * @{
-   */
-  /**
-   * Represents a participant in a synchronization, along with its state.
-   *
-   * This class is used to track down all the sync requesters we are providing
-   * to. In such scenario, it won't be uncommon to have the @p synchronizer
-   * field set with a connection to the MonitorDBStore, the @p timeout field
-   * containing a timeout event and @p entity containing the entity instance
-   * of the monitor we are here representing.
-   *
-   * The sync requester will also use this class to represent both the sync
-   * leader and the sync provider.
-   */
-  struct SyncEntityImpl {
+  void sync_start(entity_addrvec_t &addrs, bool full);
 
-    /**
-     * Store synchronization related Sync state.
-     */
-    enum {
-      /**
-       * No state whatsoever. We are not providing any sync suppport.
-       */
-      STATE_NONE   = 0,
-      /**
-       * This entity's sync effort is currently focused on reading and sharing
-       * our whole store state with @p entity. This means all the entries in
-       * the key/value space.
-       */
-      STATE_WHOLE  = 1,
-      /**
-       * This entity's sync effor is currently focused on reading and sharing
-       * our Paxos state with @p entity. This means all the Paxos-related
-       * key/value entries, such as the Paxos versions.
-       */
-      STATE_PAXOS  = 2
-    };
-
-    /**
-     * The entity instace of the monitor whose sync effort we are representing.
-     */
-    entity_inst_t entity;
-    /**
-     * Our Monitor.
-     */
-    Monitor *mon;
-    /**
-     * The Paxos version we are focusing on.
-     *
-     * @note This is not used at the moment. We are still assessing whether we
-     *	     need it.
-     */
-    version_t version;
-    /**
-     * Timeout event. Its type and purpose varies depending on the situation.
-     */
-    Context *timeout;
-    /**
-     * Last key received during a sync effort.
-     *
-     * This field is mainly used by the sync requester to track the last
-     * received key, in case he needs to switch providers due to failure. The
-     * sync provider will also use this field whenever the requester specifies
-     * a last received key when requesting the provider to start sending his
-     * store chunks.
-     */
-    pair<string,string> last_received_key;
-    /**
-     * Hold the Store Synchronization related Sync State.
-     */
-    int sync_state;
-    /**
-     * The MonitorDBStore's chunk iterator instance we are currently using
-     * to obtain the store's chunks and pack them to the sync requester.
-     */
-    MonitorDBStore::Synchronizer synchronizer;
-    MonitorDBStore::Synchronizer paxos_synchronizer;
-    /* Should only be used for debugging purposes */
-    /**
-     * crc of the contents read from the store.
-     *
-     * @note may not always be available, as it is used only on specific
-     *	     points in time during the sync process.
-     * @note depends on '--mon-sync-debug' being set.
-     */
-    __u32 crc;
-    /**
-     * Should be true if @p crc has been set.
-     */
-    bool crc_available;
-    /**
-     * Total synchronization attempts.
-     */
-    int attempts;
-
-    SyncEntityImpl(entity_inst_t &entity, Monitor *mon)
-      : entity(entity),
-	mon(mon),
-	version(0),
-	timeout(NULL),
-	sync_state(STATE_NONE),
-	crc(0),
-	crc_available(false),
-	attempts(0)
-    { }
-
-    /**
-     * Obtain current Sync State name.
-     *
-     * @returns Name of current sync state.
-     */
-    string get_state() {
-      switch (sync_state) {
-	case STATE_NONE: return "none";
-	case STATE_WHOLE: return "whole";
-	case STATE_PAXOS: return "paxos";
-	default: return "unknown";
-      }
-    }
-    /**
-     * Obtain the paxos version at which this sync started.
-     *
-     * @returns Paxos version at which this sync started
-     */
-    version_t get_version() {
-      return version;
-    }
-    /**
-     * Set a timeout event for this sync entity.
-     *
-     * @param event Timeout class to be called after @p fire_after seconds.
-     * @param fire_after Number of seconds until we fire the @p event event.
-     */
-    void set_timeout(Context *event, double fire_after) {
-      cancel_timeout();
-      timeout = event;
-      mon->timer.add_event_after(fire_after, timeout);
-    }
-    /**
-     * Cancel the currently set timeout, if any.
-     */
-    void cancel_timeout() {
-      if (timeout)
-	mon->timer.cancel_event(timeout);
-      timeout = NULL;
-    }
-    /**
-     * Initiate the required fields for obtaining chunks out of the
-     * MonitorDBStore.
-     *
-     * This function will initiate @p synchronizer with a chunk iterator whose
-     * scope is all the keys/values that belong to one of the sync targets
-     * (i.e., paxos services or paxos).
-     *
-     * Calling @p Monitor::sync_update() will be essential during the efforts
-     * of providing a correct store state to the requester, since we will need
-     * to eventually update the iterator in order to start packing the Paxos
-     * versions.
-     */
-    void sync_init() {
-      sync_state = STATE_WHOLE;
-      set<string> sync_targets = mon->get_sync_targets_names();
-
-      string prefix("paxos");
-      paxos_synchronizer = mon->store->get_synchronizer(prefix);
-      version = mon->paxos->get_version();
-      generic_dout(10) << __func__ << " version " << version << dendl;
-
-      synchronizer = mon->store->get_synchronizer(last_received_key,
-						  sync_targets);
-      sync_update();
-      assert(synchronizer->has_next_chunk());
-    }
-    /**
-     * Update the @p synchronizer chunk iterator, if needed.
-     *
-     * Whenever we reach the end of the iterator during @p STATE_WHOLE, we
-     * must update the @p synchronizer to an iterator focused on reading only
-     * Paxos versions. This is an essential part of the sync store approach,
-     * and it will guarantee that we end up with a consistent store.
-     */
-    void sync_update() {
-      assert(sync_state != STATE_NONE);
-      assert(synchronizer.use_count() != 0);
-
-      if (!synchronizer->has_next_chunk()) {
-	crc_set(synchronizer->crc());
-	if (sync_state == STATE_WHOLE) {
-          assert(paxos_synchronizer.use_count() != 0);
-	  sync_state = STATE_PAXOS;
-          synchronizer = paxos_synchronizer;
-	}
-      }
-    }
-
-    /* For debug purposes only */
-    /**
-     * Check if we have a CRC available.
-     *
-     * @returns true if crc is available; false otherwise.
-     */
-    bool has_crc() {
-      return (g_conf->mon_sync_debug && crc_available);
-    }
-    /**
-     * Set @p crc to @p to_set
-     *
-     * @param to_set a crc value to set.
-     */
-    void crc_set(__u32 to_set) {
-      crc = to_set;
-      crc_available = true;
-    }
-    /**
-     * Get the current CRC value from @p crc
-     *
-     * @returns the currenct CRC value from @p crc
-     */
-    __u32 crc_get() {
-      return crc;
-    }
-    /**
-     * Clear the current CRC.
-     */
-    void crc_clear() {
-      crc_available = false;
-    }
-  };
-  typedef std::tr1::shared_ptr< SyncEntityImpl > SyncEntity;
+public:
   /**
-   * Get a Monitor::SyncEntity instance.
-   *
-   * @param entity The monitor's entity instance that we want to associate
-   *		   with this Monitor::SyncEntity.
-   * @param mon The Monitor.
-   *
-   * @returns A Monitor::SyncEntity
+   * force a sync on next mon restart
    */
-  SyncEntity get_sync_entity(entity_inst_t &entity, Monitor *mon) {
-    return std::tr1::shared_ptr<SyncEntityImpl>(
-	new SyncEntityImpl(entity, mon));
-  }
-  /**
-   * Callback class responsible for dealing with the consequences of a sync
-   * process timing out.
-   */
-  struct C_SyncTimeout : public Context {
-    Monitor *mon;
-    entity_inst_t entity;
+  void sync_force(ceph::Formatter *f);
 
-    C_SyncTimeout(Monitor *mon, entity_inst_t &entity)
-      : mon(mon), entity(entity)
-    { }
+private:
+  /**
+   * store critical state for safekeeping during sync
+   *
+   * We store a few things on the side that we don't want to get clobbered by sync.  This
+   * includes the latest monmap and a lower bound on last_committed.
+   */
+  void sync_stash_critical_state(MonitorDBStore::TransactionRef tx);
 
-    void finish(int r) {
-      mon->sync_timeout(entity);
-    }
-  };
   /**
-   * Map containing all the monitor entities to whom we are acting as sync
-   * providers.
+   * reset the sync timeout
+   *
+   * This is used on the client to restart if things aren't progressing
    */
-  map<entity_inst_t, SyncEntity> sync_entities;
+  void sync_reset_timeout();
+
   /**
-   * RNG used for the sync (currently only used to pick random monitors)
+   * trim stale sync provider state
+   *
+   * If someone is syncing from us and hasn't talked to us recently, expire their state.
    */
-  SimpleRNG sync_rng;
+  void sync_trim_providers();
+
   /**
-   * Obtain random monitor from the monmap.
+   * Complete a sync
    *
-   * @param other Any monitor other than the one with rank @p other
-   * @returns The picked monitor's name.
+   * Finish up a sync after we've gotten all of the chunks.
+   *
+   * @param last_committed final last_committed value from provider
    */
-  int _pick_random_mon(int other = -1);
-  int _pick_random_quorum_mon(int other = -1);
+  void sync_finish(version_t last_committed);
+
   /**
-   * Deal with the consequences of @p entity's sync timing out.
-   *
-   * @note Both the sync provider and the sync requester make use of this
-   *	   function, since both use the @p Monitor::C_SyncTimeout callback.
-   *
-   * Being the sync provider, whenever a Monitor::C_SyncTimeout is triggered,
-   * we only have to clean up the sync requester's state we are maintaining.
-   *
-   * Being the sync requester, we will have to choose a new sync provider, and
-   * resume our sync from where it was left.
-   *
-   * @param entity Entity instance of the monitor whose sync has timed out.
+   * request the next chunk from the provider
    */
-  void sync_timeout(entity_inst_t &entity);
+  void sync_get_next_chunk();
+
   /**
-   * Cleanup the state we, the provider, are keeping during @p entity's sync.
-   *
-   * @param entity Entity instance of the monitor whose sync state we are
-   *		   cleaning up.
-   */
-  void sync_provider_cleanup(entity_inst_t &entity);
-  /**
-   * Handle a Sync Start Chunks request from a sync requester.
-   *
-   * This request will create the necessary state our the provider's end, and
-   * the provider will then be able to send chunks of his own store to the
-   * requester.
+   * handle sync message
    *
    * @param m Sync message with operation type MMonSync::OP_START_CHUNKS
    */
-  void handle_sync_start_chunks(MMonSync *m);
-  /**
-   * Handle a requester's reply to the last chunk we sent him.
-   *
-   * We will only send a new chunk to the sync requester once he has acked the
-   * reception of the last chunk we sent them.
-   *
-   * That's also how we will make sure that, on their end, they became aware
-   * that there are no more chunks to send (since we shall tag a message with
-   * MMonSync::FLAG_LAST when we are sending them the last chunk of all),
-   * allowing us to clean up the requester's state.
-   *
-   * @param m Sync message with operation type MMonSync::OP_CHUNK_REPLY
-   */
-  void handle_sync_chunk_reply(MMonSync *m);
-  /**
-   * Send a chunk to the sync entity represented by @p sync.
-   *
-   * This function will send the next chunk available on the synchronizer. If
-   * it happens to be the last chunk, then the message shall be marked as
-   * such using MMonSync::FLAG_LAST.
-   *
-   * @param sync A Monitor::SyncEntity representing a sync requester monitor.
-   */
-  void sync_send_chunks(SyncEntity sync);
-  /**
-   * @} // Synchronization Provider-specific
-   */
-  /**
-   * @defgroup Synchronization Requester-specific
-   * @{
-   */
-  /**
-   * The state in which we (the sync leader, provider or requester) are in
-   * regard to our sync process (if we are the requester) or any entity that
-   * we may be leading or providing to.
-   */
-  enum {
-    /**
-     * We are not part of any synchronization effort, or it has not began yet.
-     */
-    SYNC_STATE_NONE   = 0,
-    /**
-     * We have started our role in the synchronization.
-     *
-     * This state may have multiple meanings, depending on which entity is
-     * employing it and within which context.
-     *
-     * For instance, the leader will consider a sync requester to enter
-     * SYNC_STATE_START whenever it receives a MMonSync::OP_START from the
-     * said requester. On the other hand, the provider will consider that the
-     * requester enters this state after receiving a MMonSync::OP_START_CHUNKS.
-     * The sync requester will enter this state as soon as it begins its sync
-     * efforts.
-     */
-    SYNC_STATE_START  = 1,
-    /**
-     * We are synchronizing chunks.
-     *
-     * This state is not used by the sync leader; only the sync requester and
-     * the sync provider will.
-     */
-    SYNC_STATE_CHUNKS = 2,
-    /**
-     * We are stopping the sync effort.
-     */
-    SYNC_STATE_STOP   = 3
-  };
-  /**
-   * The current sync state.
-   *
-   * This field is only used by the sync requester, being the only one that
-   * will take this state as part of its global state. The sync leader and the
-   * sync provider will only associate sync states to other entities (i.e., to
-   * sync requesters), and those shall be kept in the @p sync_entities_states
-   * map.
-   */
-  int sync_state;
-  /**
-   * Callback class responsible for dealing with the consequences of the sync
-   * requester not receiving a MMonSync::OP_START_REPLY in a timely manner.
-   */
-  struct C_SyncStartTimeout : public Context {
-    Monitor *mon;
+  void handle_sync(MonOpRequestRef op);
 
-    C_SyncStartTimeout(Monitor *mon)
-      : mon(mon)
-    { }
+  void _sync_reply_no_cookie(MonOpRequestRef op);
 
-    void finish(int r) {
-      mon->sync_start_reply_timeout();
-    }
-  };
-  /**
-   * Callback class responsible for retrying a Sync Start after a given
-   * backoff period, whenever the Sync Leader flags a MMonSync::OP_START_REPLY
-   * with the MMonSync::FLAG_RETRY flag.
-   */
-  struct C_SyncStartRetry : public Context {
-    Monitor *mon;
-    entity_inst_t entity;
+  void handle_sync_get_cookie(MonOpRequestRef op);
+  void handle_sync_get_chunk(MonOpRequestRef op);
+  void handle_sync_finish(MonOpRequestRef op);
 
-    C_SyncStartRetry(Monitor *mon, entity_inst_t &entity)
-      : mon(mon), entity(entity)
-    { }
-
-    void finish(int r) {
-      mon->bootstrap();
-    }
-  };
-  /**
-   * We use heartbeats to check if both the Leader and the Synchronization
-   * Requester are both still alive, so we can determine if we should continue
-   * with the synchronization process, granted that trim is disabled.
-   */
-  struct C_HeartbeatTimeout : public Context {
-    Monitor *mon;
-
-    C_HeartbeatTimeout(Monitor *mon)
-      : mon(mon)
-    { }
-
-    void finish(int r) {
-      mon->sync_requester_abort();
-    }
-  };
-  /**
-   * Callback class responsible for sending a heartbeat message to the sync
-   * leader. We use this callback to keep an assynchronous heartbeat with
-   * the sync leader at predefined intervals.
-   */
-  struct C_HeartbeatInterval : public Context {
-    Monitor *mon;
-    entity_inst_t entity;
-
-    C_HeartbeatInterval(Monitor *mon, entity_inst_t &entity)
-      : mon(mon), entity(entity)
-    { }
-
-    void finish(int r) {
-      mon->sync_leader->set_timeout(new C_HeartbeatTimeout(mon),
-				    g_conf->mon_sync_heartbeat_timeout);
-      mon->sync_send_heartbeat(entity);
-    }
-  };
-  /**
-   * Callback class responsible for dealing with the consequences of never
-   * receiving a reply to a MMonSync::OP_FINISH sent to the sync leader.
-   */
-  struct C_SyncFinishReplyTimeout : public Context {
-    Monitor *mon;
-
-    C_SyncFinishReplyTimeout(Monitor *mon)
-      : mon(mon)
-    { }
-
-    void finish(int r) {
-      mon->sync_finish_reply_timeout();
-    }
-  };
-  /**
-   * The entity we, the sync requester, consider to be our sync leader. If
-   * there is a formed quorum, the @p sync_leader should represent the actual
-   * cluster Leader; otherwise, it can be any monitor and will likely be the
-   * same as @p sync_provider.
-   */
-  SyncEntity sync_leader;
-  /**
-   * The entity we, the sync requester, are synchronizing against. This entity
-   * will be our source of store chunks, and we will ultimately obtain a store
-   * state equal (or very similar, maybe off by a couple of versions) as their
-   * own.
-   */
-  SyncEntity sync_provider;
-  /**
-   * Clean up the Sync Requester's state (both in-memory and in-store).
-   */
-  void sync_requester_cleanup();
-  /**
-   * Abort the current sync effort.
-   *
-   * This will be translated into a MMonSync::OP_ABORT sent to the sync leader
-   * and to the sync provider, and ultimately it will also involve calling
-   * @p Monitor::sync_requester_cleanup() to clean up our current sync state.
-   */
-  void sync_requester_abort();
-  /**
-   * Deal with a timeout while waiting for a MMonSync::OP_FINISH_REPLY.
-   *
-   * This will be assumed as a leader failure, and having been exposed to the
-   * side-effects of a new Leader being elected, we have no other choice but
-   * to abort our sync process and start fresh.
-   */
-  void sync_finish_reply_timeout();
-  /**
-   * Deal with a timeout while waiting for a MMonSync::OP_START_REPLY.
-   *
-   * This will be assumed as a leader failure. Since we didn't get to do
-   * much work (as we haven't even started our sync), we will simply bootstrap
-   * and start off fresh with a new sync leader.
-   */
-  void sync_start_reply_timeout();
-  /**
-   * Start the synchronization efforts.
-   *
-   * This function should be called whenever we find the need to synchronize
-   * our store state with the remaining cluster.
-   *
-   * Starting the sync process means that we will have to request the cluster
-   * Leader (if there is a formed quorum) to stop trimming the Paxos state and
-   * allow us to start synchronizing with the sync provider we picked.
-   *
-   * @param entity An entity instance referring to the sync provider we picked.
-   */
-  void sync_start(entity_inst_t &entity);
-  /**
-   * Request the provider to start sending the chunks of his store, in order
-   * for us to obtain a consistent store state similar to the one shared by
-   * the cluster.
-   *
-   * @param provider The SyncEntity representing the Sync Provider.
-   */
-  void sync_start_chunks(SyncEntity provider);
-  /**
-   * Handle a MMonSync::OP_START_REPLY sent by the Sync Leader.
-   *
-   * Reception of this message may be twofold: if it was marked with the
-   * MMonSync::FLAG_RETRY flag, we must backoff for a while and retry starting
-   * the sync at a later time; otherwise, we have the green-light to request
-   * the Sync Provider to start sharing his chunks with us.
-   *
-   * @param m Sync message with operation type MMonSync::OP_START_REPLY
-   */
-  void handle_sync_start_reply(MMonSync *m);
-  /**
-   * Handle a Heartbeat reply sent by the Sync Leader.
-   *
-   * We use heartbeats to keep the Sync Leader aware that we are keeping our
-   * sync efforts alive. We also use them to make sure our Sync Leader is
-   * still alive. If the Sync Leader fails, we will have to abort our on-going
-   * sync, or we could incurr in an inconsistent store state due to a trim on
-   * the Paxos state of the monitor provinding us with his store chunks.
-   *
-   * @param m Sync message with operation type MMonSync::OP_HEARTBEAT_REPLY
-   */
-  void handle_sync_heartbeat_reply(MMonSync *m);
-  /**
-   * Handle a chunk sent by the Sync Provider.
-   *
-   * We will receive the Sync Provider's store in chunks. These are encoded
-   * in bufferlists containing a transaction that will be directly applied
-   * onto our MonitorDBStore.
-   *
-   * Whenever we receive such a message, we must reply to the Sync Provider,
-   * as a way of acknowledging the reception of its last chunk. If the message
-   * is tagged with a MMonSync::FLAG_LAST, we can then consider we have
-   * received all the chunks the Sync Provider had to offer, and finish our
-   * sync efforts with the Sync Leader.
-   *
-   * @param m Sync message with operation type MMonSync::OP_CHUNK
-   */
-  void handle_sync_chunk(MMonSync *m);
-  /**
-   * Handle a reply sent by the Sync Leader to a MMonSync::OP_FINISH.
-   *
-   * As soon as we receive this message, we know we finally have a store state
-   * consistent with the remaining cluster (give or take a couple of versions).
-   * We may then bootstrap and attempt to join the other monitors in the
-   * cluster.
-   *
-   * @param m Sync message with operation type MMonSync::OP_FINISH_REPLY
-   */
-  void handle_sync_finish_reply(MMonSync *m);
-  /**
-   * Stop our synchronization effort by sending a MMonSync::OP_FINISH to the
-   * Sync Leader.
-   *
-   * Once we receive the last chunk from the Sync Provider, we are in
-   * conditions of officially finishing our sync efforts. With that purpose in
-   * mind, we must then send a MMonSync::OP_FINISH to the Leader, letting him
-   * know that we no longer require the Paxos state to be preserved.
-   */
-  void sync_stop();
-  /**
-   * @} // Synchronization Requester-specific
-   */
-  const string get_sync_state_name(int s) const {
-    switch (s) {
-    case SYNC_STATE_NONE: return "none";
-    case SYNC_STATE_START: return "start";
-    case SYNC_STATE_CHUNKS: return "chunks";
-    case SYNC_STATE_STOP: return "stop";
-    }
-    return "???";
-  }
-  /**
-   * Obtain a string describing the current Sync State.
-   *
-   * @returns A string describing the current Sync State, if any, or an empty
-   *	      string if no sync (or sync effort we know of) is in progress.
-   */
-  const string get_sync_state_name() const {
-    string sn;
-
-    if (sync_role == SYNC_ROLE_NONE)
-      return "";
-
-    sn.append(" sync(");
-
-    if (sync_role & SYNC_ROLE_LEADER)
-      sn.append(" leader");
-    if (sync_role & SYNC_ROLE_PROVIDER)
-      sn.append(" provider");
-    if (sync_role & SYNC_ROLE_REQUESTER)
-      sn.append(" requester");
-
-    sn.append(" state ");
-    sn.append(get_sync_state_name(sync_state));
-
-    sn.append(" )");
-
-    return sn;
-  }
+  void handle_sync_cookie(MonOpRequestRef op);
+  void handle_sync_forward(MonOpRequestRef op);
+  void handle_sync_chunk(MonOpRequestRef op);
+  void handle_sync_no_cookie(MonOpRequestRef op);
 
   /**
    * @} // Synchronization
    */
 
-  list<Context*> waitfor_quorum;
-  list<Context*> maybe_wait_for_quorum;
+  std::list<Context*> waitfor_quorum;
+  std::list<Context*> maybe_wait_for_quorum;
 
   /**
    * @defgroup Monitor_h_TimeCheck Monitor Clock Drift Early Warning System
@@ -1105,26 +515,28 @@ private:
    *  - Once all the quorum members have pong'ed, the leader will share the
    *    clock skew and latency maps with all the monitors in the quorum.
    */
-  map<entity_inst_t, utime_t> timecheck_waiting;
-  map<entity_inst_t, double> timecheck_skews;
-  map<entity_inst_t, double> timecheck_latencies;
+  std::map<int, utime_t> timecheck_waiting;
+  std::map<int, double> timecheck_skews;
+  std::map<int, double> timecheck_latencies;
   // odd value means we are mid-round; even value means the round has
   // finished.
   version_t timecheck_round;
   unsigned int timecheck_acks;
   utime_t timecheck_round_start;
+  friend class HealthMonitor;
+  /* When we hit a skew we will start a new round based off of
+   * 'mon_timecheck_skew_interval'. Each new round will be backed off
+   * until we hit 'mon_timecheck_interval' -- which is the typical
+   * interval when not in the presence of a skew.
+   *
+   * This variable tracks the number of rounds with skews since last clean
+   * so that we can report to the user and properly adjust the backoff.
+   */
+  uint64_t timecheck_rounds_since_clean;
   /**
    * Time Check event.
    */
   Context *timecheck_event;
-
-  struct C_TimeCheck : public Context {
-    Monitor *mon;
-    C_TimeCheck(Monitor *m) : mon(m) { }
-    void finish(int r) {
-      mon->timecheck_start_round();
-    }
-  };
 
   void timecheck_start();
   void timecheck_finish();
@@ -1132,78 +544,95 @@ private:
   void timecheck_finish_round(bool success = true);
   void timecheck_cancel_round();
   void timecheck_cleanup();
+  void timecheck_reset_event();
+  void timecheck_check_skews();
   void timecheck_report();
   void timecheck();
-  health_status_t timecheck_status(ostringstream &ss,
+  health_status_t timecheck_status(std::ostringstream &ss,
                                    const double skew_bound,
                                    const double latency);
-  void handle_timecheck_leader(MTimeCheck *m);
-  void handle_timecheck_peon(MTimeCheck *m);
-  void handle_timecheck(MTimeCheck *m);
+  void handle_timecheck_leader(MonOpRequestRef op);
+  void handle_timecheck_peon(MonOpRequestRef op);
+  void handle_timecheck(MonOpRequestRef op);
+
+  /**
+   * Returns 'true' if this is considered to be a skew; 'false' otherwise.
+   */
+  bool timecheck_has_skew(const double skew_bound, double *abs) const {
+    double abs_skew = std::fabs(skew_bound);
+    if (abs)
+      *abs = abs_skew;
+    return (abs_skew > g_conf()->mon_clock_drift_allowed);
+  }
+
   /**
    * @}
    */
   /**
-   * @defgroup Monitor_h_stats Keep track of monitor statistics
-   * @{
+   * Handle ping messages from others.
    */
-  struct MonStatsEntry {
-    // data dir
-    uint64_t kb_total;
-    uint64_t kb_used;
-    uint64_t kb_avail;
-    unsigned int latest_avail_ratio;
-    utime_t last_update;
-  };
+  void handle_ping(MonOpRequestRef op);
 
-  struct MonStats {
-    MonStatsEntry ours;
-    map<entity_inst_t,MonStatsEntry> others;
-  };
-
-  MonStats stats;
-
-  void stats_update();
-  /**
-   * @}
-   */
-
-  Context *probe_timeout_event;  // for probing
-
-  struct C_ProbeTimeout : public Context {
-    Monitor *mon;
-    C_ProbeTimeout(Monitor *m) : mon(m) {}
-    void finish(int r) {
-      mon->probe_timeout(r);
-    }
-  };
+  Context *probe_timeout_event = nullptr;  // for probing
 
   void reset_probe_timeout();
   void cancel_probe_timeout();
   void probe_timeout(int r);
 
+  void _apply_compatset_features(CompatSet &new_features);
+
 public:
   epoch_t get_epoch();
-  int get_leader() { return leader; }
-  const set<int>& get_quorum() { return quorum; }
-  set<string> get_quorum_names() {
-    set<string> q;
-    for (set<int>::iterator p = quorum.begin(); p != quorum.end(); ++p)
-      q.insert(monmap->get_name(*p));
+  int get_leader() const { return leader; }
+  std::string get_leader_name() {
+    return quorum.empty() ? std::string() : monmap->get_name(leader);
+  }
+  const std::set<int>& get_quorum() const { return quorum; }
+  std::list<std::string> get_quorum_names() {
+    std::list<std::string> q;
+    for (auto p = quorum.begin(); p != quorum.end(); ++p)
+      q.push_back(monmap->get_name(*p));
     return q;
   }
-  uint64_t get_quorum_features() const {
-    return quorum_features;
+  uint64_t get_quorum_con_features() const {
+    return quorum_con_features;
   }
+  mon_feature_t get_quorum_mon_features() const {
+    return quorum_mon_features;
+  }
+  uint64_t get_required_features() const {
+    return required_features;
+  }
+  mon_feature_t get_required_mon_features() const {
+    return monmap->get_required_features();
+  }
+  void apply_quorum_to_compatset_features();
+  void apply_monmap_to_compatset_features();
+  void calc_quorum_requirements();
 
+  void get_combined_feature_map(FeatureMap *fm);
+
+private:
+  void _reset();   ///< called from bootstrap, start_, or join_election
+  void wait_for_paxos_write();
+  void _finish_svc_election(); ///< called by {win,lose}_election
+  void respawn();
+public:
   void bootstrap();
-  void reset();
+  void join_election();
   void start_election();
   void win_standalone_election();
-  void win_election(epoch_t epoch, set<int>& q,
-		    uint64_t features);         // end election (called by Elector)
-  void lose_election(epoch_t epoch, set<int>& q, int l,
-		     uint64_t features); // end election (called by Elector)
+  // end election (called by Elector)
+  void win_election(epoch_t epoch, const std::set<int>& q,
+		    uint64_t features,
+                    const mon_feature_t& mon_features,
+		    ceph_release_t min_mon_release,
+		    const std::map<int,Metadata>& metadata);
+  void lose_election(epoch_t epoch, std::set<int>& q, int l,
+		     uint64_t features,
+                     const mon_feature_t& mon_features,
+		     ceph_release_t min_mon_release);
+  // end election (called by Elector)
   void finish_election();
 
   void update_logger();
@@ -1211,82 +640,160 @@ public:
   /**
    * Vector holding the Services serviced by this Monitor.
    */
-  vector<PaxosService*> paxos_service;
-
-  PaxosService *get_paxos_service_by_name(const string& name);
-
-  class PGMonitor *pgmon() {
-    return (class PGMonitor *)paxos_service[PAXOS_PGMAP];
-  }
+  std::array<std::unique_ptr<PaxosService>, PAXOS_NUM> paxos_service;
 
   class MDSMonitor *mdsmon() {
-    return (class MDSMonitor *)paxos_service[PAXOS_MDSMAP];
+    return (class MDSMonitor *)paxos_service[PAXOS_MDSMAP].get();
   }
 
   class MonmapMonitor *monmon() {
-    return (class MonmapMonitor *)paxos_service[PAXOS_MONMAP];
+    return (class MonmapMonitor *)paxos_service[PAXOS_MONMAP].get();
   }
 
   class OSDMonitor *osdmon() {
-    return (class OSDMonitor *)paxos_service[PAXOS_OSDMAP];
+    return (class OSDMonitor *)paxos_service[PAXOS_OSDMAP].get();
   }
 
   class AuthMonitor *authmon() {
-    return (class AuthMonitor *)paxos_service[PAXOS_AUTH];
+    return (class AuthMonitor *)paxos_service[PAXOS_AUTH].get();
   }
 
   class LogMonitor *logmon() {
-    return (class LogMonitor*) paxos_service[PAXOS_LOG];
+    return (class LogMonitor*) paxos_service[PAXOS_LOG].get();
+  }
+
+  class MgrMonitor *mgrmon() {
+    return (class MgrMonitor*) paxos_service[PAXOS_MGR].get();
+  }
+
+  class MgrStatMonitor *mgrstatmon() {
+    return (class MgrStatMonitor*) paxos_service[PAXOS_MGRSTAT].get();
+  }
+
+  class HealthMonitor *healthmon() {
+    return (class HealthMonitor*) paxos_service[PAXOS_HEALTH].get();
+  }
+
+  class ConfigMonitor *configmon() {
+    return (class ConfigMonitor*) paxos_service[PAXOS_CONFIG].get();
   }
 
   friend class Paxos;
   friend class OSDMonitor;
   friend class MDSMonitor;
   friend class MonmapMonitor;
-  friend class PGMonitor;
   friend class LogMonitor;
+  friend class ConfigKeyService;
 
-  QuorumService *health_monitor;
-  QuorumService *config_key_service;
+  std::unique_ptr<ConfigKeyService> config_key_service;
 
   // -- sessions --
   MonSessionMap session_map;
+  ceph::mutex session_map_lock = ceph::make_mutex("Monitor::session_map_lock");
   AdminSocketHook *admin_hook;
 
-  void check_subs();
-  void check_sub(Subscription *sub);
-
+  template<typename Func, typename...Args>
+  void with_session_map(Func&& func) {
+    std::lock_guard l(session_map_lock);
+    std::forward<Func>(func)(session_map);
+  }
   void send_latest_monmap(Connection *con);
 
   // messages
-  void handle_get_version(MMonGetVersion *m);
-  void handle_subscribe(MMonSubscribe *m);
-  void handle_mon_get_map(MMonGetMap *m);
-  bool _allowed_command(MonSession *s, const vector<std::string>& cmd);
-  void _mon_status(ostream& ss);
-  void _quorum_status(ostream& ss);
-  void _sync_status(ostream& ss);
-  void _sync_force(ostream& ss);
-  void _add_bootstrap_peer_hint(string cmd, string args, ostream& ss);
-  void handle_command(class MMonCommand *m);
-  void handle_route(MRoute *m);
+  void handle_get_version(MonOpRequestRef op);
+  void handle_subscribe(MonOpRequestRef op);
+  void handle_mon_get_map(MonOpRequestRef op);
+
+  static void _generate_command_map(cmdmap_t& cmdmap,
+                                    std::map<std::string,std::string> &param_str_map);
+  static const MonCommand *_get_moncommand(
+    const std::string &cmd_prefix,
+    const std::vector<MonCommand>& cmds);
+  bool _allowed_command(MonSession *s, const std::string& module,
+			const std::string& prefix,
+                        const cmdmap_t& cmdmap,
+                        const std::map<std::string,std::string>& param_str_map,
+                        const MonCommand *this_cmd);
+  void get_mon_status(ceph::Formatter *f);
+  void _quorum_status(ceph::Formatter *f, std::ostream& ss);
+  bool _add_bootstrap_peer_hint(std::string_view cmd, const cmdmap_t& cmdmap,
+				std::ostream& ss);
+  void handle_tell_command(MonOpRequestRef op);
+  void handle_command(MonOpRequestRef op);
+  void handle_route(MonOpRequestRef op);
+
+  int get_mon_metadata(int mon, ceph::Formatter *f, std::ostream& err);
+  int print_nodes(ceph::Formatter *f, std::ostream& err);
+
+  // track metadata reported by win_election()
+  std::map<int, Metadata> mon_metadata;
+  std::map<int, Metadata> pending_metadata;
 
   /**
-   * Generate health report
    *
-   * @param status one-line status summary
-   * @param detailbl optional bufferlist* to fill with a detailed report
    */
-  void get_health(string& status, bufferlist *detailbl, Formatter *f);
-  void get_status(stringstream &ss, Formatter *f);
+  struct health_cache_t {
+    health_status_t overall;
+    std::string summary;
 
-  void reply_command(MMonCommand *m, int rc, const string &rs, version_t version);
-  void reply_command(MMonCommand *m, int rc, const string &rs, bufferlist& rdata, version_t version);
+    void reset() {
+      // health_status_t doesn't really have a NONE value and we're not
+      // okay with setting something else (say, HEALTH_ERR).  so just
+      // leave it be.
+      summary.clear();
+    }
+  } health_status_cache;
 
-  /**
-   * Handle Synchronization-related messages.
-   */
-  void handle_probe(MMonProbe *m);
+  Context *health_tick_event = nullptr;
+  Context *health_interval_event = nullptr;
+
+  void health_tick_start();
+  void health_tick_stop();
+  ceph::real_clock::time_point health_interval_calc_next_update();
+  void health_interval_start();
+  void health_interval_stop();
+  void health_events_cleanup();
+
+  void health_to_clog_update_conf(const std::set<std::string> &changed);
+
+  void do_health_to_clog_interval();
+  void do_health_to_clog(bool force = false);
+
+  void log_health(
+    const health_check_map_t& updated,
+    const health_check_map_t& previous,
+    MonitorDBStore::TransactionRef t);
+
+protected:
+
+  class HealthCheckLogStatus {
+    public:
+    health_status_t severity;
+    std::string last_message;
+    utime_t updated_at = 0;
+    HealthCheckLogStatus(health_status_t severity_,
+                         const std::string &last_message_,
+                         utime_t updated_at_)
+      : severity(severity_),
+        last_message(last_message_),
+        updated_at(updated_at_)
+    {}
+  };
+  std::map<std::string, HealthCheckLogStatus> health_check_log_times;
+
+public:
+
+  void get_cluster_status(std::stringstream &ss, ceph::Formatter *f,
+			  MonSession *session);
+
+  void reply_command(MonOpRequestRef op, int rc, const std::string &rs, version_t version);
+  void reply_command(MonOpRequestRef op, int rc, const std::string &rs, ceph::buffer::list& rdata, version_t version);
+
+  void reply_tell_command(MonOpRequestRef op, int rc, const std::string &rs);
+
+
+
+  void handle_probe(MonOpRequestRef op);
   /**
    * Handle a Probe Operation, replying with our name, quorum and known versions.
    *
@@ -1301,123 +808,209 @@ public:
    *
    * @param m A Probe message, with an operation of type Probe.
    */
-  void handle_probe_probe(MMonProbe *m);
-  void handle_probe_reply(MMonProbe *m);
+  void handle_probe_probe(MonOpRequestRef op);
+  void handle_probe_reply(MonOpRequestRef op);
 
   // request routing
   struct RoutedRequest {
     uint64_t tid;
-    bufferlist request_bl;
+    ceph::buffer::list request_bl;
     MonSession *session;
-    Connection *con;
-    entity_inst_t client_inst;
+    ConnectionRef con;
+    uint64_t con_features;
+    MonOpRequestRef op;
 
+    RoutedRequest() : tid(0), session(NULL), con_features(0) {}
     ~RoutedRequest() {
       if (session)
 	session->put();
-      if (con)
-	con->put();
     }
   };
   uint64_t routed_request_tid;
-  map<uint64_t, RoutedRequest*> routed_requests;
-  
-  void forward_request_leader(PaxosServiceMessage *req);
-  void handle_forward(MForward *m);
-  void try_send_message(Message *m, const entity_inst_t& to);
-  void send_reply(PaxosServiceMessage *req, Message *reply);
-  void no_reply(PaxosServiceMessage *req);
+  std::map<uint64_t, RoutedRequest*> routed_requests;
+
+  void forward_request_leader(MonOpRequestRef op);
+  void handle_forward(MonOpRequestRef op);
+  void send_reply(MonOpRequestRef op, Message *reply);
+  void no_reply(MonOpRequestRef op);
   void resend_routed_requests();
   void remove_session(MonSession *s);
   void remove_all_sessions();
-  void waitlist_or_zap_client(Message *m);
+  void waitlist_or_zap_client(MonOpRequestRef op);
 
-  void send_command(const entity_inst_t& inst,
-		    const vector<string>& com, version_t version);
+  void send_mon_message(Message *m, int rank);
+  void notify_new_monmap();
 
 public:
-  struct C_Command : public Context {
-    Monitor *mon;
-    MMonCommand *m;
+  struct C_Command : public C_MonOp {
+    Monitor &mon;
     int rc;
-    string rs;
-    bufferlist rdata;
+    std::string rs;
+    ceph::buffer::list rdata;
     version_t version;
-    C_Command(Monitor *_mm, MMonCommand *_m, int r, string s, version_t v) :
-      mon(_mm), m(_m), rc(r), rs(s), version(v){}
-    C_Command(Monitor *_mm, MMonCommand *_m, int r, string s, bufferlist rd, version_t v) :
-      mon(_mm), m(_m), rc(r), rs(s), rdata(rd), version(v){}
-    void finish(int r) {
-      if (r >= 0)
-	mon->reply_command(m, rc, rs, rdata, version);
+    C_Command(Monitor &_mm, MonOpRequestRef _op, int r, std::string s, version_t v) :
+      C_MonOp(_op), mon(_mm), rc(r), rs(s), version(v){}
+    C_Command(Monitor &_mm, MonOpRequestRef _op, int r, std::string s, ceph::buffer::list rd, version_t v) :
+      C_MonOp(_op), mon(_mm), rc(r), rs(s), rdata(rd), version(v){}
+
+    void _finish(int r) override {
+      auto m = op->get_req<MMonCommand>();
+      if (r >= 0) {
+	std::ostringstream ss;
+        if (!op->get_req()->get_connection()) {
+          ss << "connection dropped for command ";
+        } else {
+          MonSession *s = op->get_session();
+
+          // if client drops we may not have a session to draw information from.
+          if (s) {
+            ss << "from='" << s->name << " " << s->addrs << "' "
+              << "entity='" << s->entity_name << "' ";
+          } else {
+            ss << "session dropped for command ";
+          }
+        }
+        cmdmap_t cmdmap;
+        std::ostringstream ds;
+        string prefix;
+        cmdmap_from_json(m->cmd, &cmdmap, ds);
+        cmd_getval(cmdmap, "prefix", prefix);
+        if (prefix != "config set" && prefix != "config-key set")
+          ss << "cmd='" << m->cmd << "': finished";
+
+        mon.audit_clog->info() << ss.str();
+        mon.reply_command(op, rc, rs, rdata, version);
+      }
       else if (r == -ECANCELED)
-	m->put();
+        return;
       else if (r == -EAGAIN)
-	mon->_ms_dispatch(m);
+        mon.dispatch_op(op);
       else
-	assert(0 == "bad C_Command return value");
+	ceph_abort_msg("bad C_Command return value");
     }
   };
 
  private:
-  class C_RetryMessage : public Context {
+  class C_RetryMessage : public C_MonOp {
     Monitor *mon;
-    Message *msg;
   public:
-    C_RetryMessage(Monitor *m, Message *ms) : mon(m), msg(ms) {}
-    void finish(int r) {
+    C_RetryMessage(Monitor *m, MonOpRequestRef op) :
+      C_MonOp(op), mon(m) { }
+
+    void _finish(int r) override {
       if (r == -EAGAIN || r >= 0)
-	mon->_ms_dispatch(msg);
+        mon->dispatch_op(op);
       else if (r == -ECANCELED)
-	msg->put();
+        return;
       else
-	assert(0 == "bad C_RetryMessage return value");
+	ceph_abort_msg("bad C_RetryMessage return value");
     }
   };
 
   //ms_dispatch handles a lot of logic and we want to reuse it
   //on forwarded messages, so we create a non-locking version for this class
-  bool _ms_dispatch(Message *m);
-  bool ms_dispatch(Message *m) {
-    lock.Lock();
-    bool ret = _ms_dispatch(m);
-    lock.Unlock();
-    return ret;
+  void _ms_dispatch(Message *m);
+  bool ms_dispatch(Message *m) override {
+    std::lock_guard l{lock};
+    _ms_dispatch(m);
+    return true;
   }
+  void dispatch_op(MonOpRequestRef op);
   //mon_caps is used for un-connected messages from monitors
-  MonCaps * mon_caps;
-  bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new);
-  bool ms_verify_authorizer(Connection *con, int peer_type,
-			    int protocol, bufferlist& authorizer_data, bufferlist& authorizer_reply,
-			    bool& isvalid, CryptoKey& session_key);
-  bool ms_handle_reset(Connection *con);
-  void ms_handle_remote_reset(Connection *con) {}
+  MonCap mon_caps;
+  bool get_authorizer(int dest_type, AuthAuthorizer **authorizer);
+public: // for AuthMonitor msgr1:
+  int ms_handle_authentication(Connection *con) override;
+private:
+  void ms_handle_accept(Connection *con) override;
+  bool ms_handle_reset(Connection *con) override;
+  void ms_handle_remote_reset(Connection *con) override {}
+  bool ms_handle_refused(Connection *con) override;
 
-  int write_default_keyring(bufferlist& bl);
+  // AuthClient
+  int get_auth_request(
+    Connection *con,
+    AuthConnectionMeta *auth_meta,
+    uint32_t *method,
+    std::vector<uint32_t> *preferred_modes,
+    ceph::buffer::list *out) override;
+  int handle_auth_reply_more(
+    Connection *con,
+    AuthConnectionMeta *auth_meta,
+   const ceph::buffer::list& bl,
+    ceph::buffer::list *reply) override;
+  int handle_auth_done(
+    Connection *con,
+    AuthConnectionMeta *auth_meta,
+    uint64_t global_id,
+    uint32_t con_mode,
+    const ceph::buffer::list& bl,
+    CryptoKey *session_key,
+    std::string *connection_secret) override;
+  int handle_auth_bad_method(
+    Connection *con,
+    AuthConnectionMeta *auth_meta,
+    uint32_t old_auth_method,
+    int result,
+    const std::vector<uint32_t>& allowed_methods,
+    const std::vector<uint32_t>& allowed_modes) override;
+  // /AuthClient
+  // AuthServer
+  int handle_auth_request(
+    Connection *con,
+    AuthConnectionMeta *auth_meta,
+    bool more,
+    uint32_t auth_method,
+    const ceph::buffer::list& bl,
+    ceph::buffer::list *reply) override;
+  // /AuthServer
+
+  int write_default_keyring(ceph::buffer::list& bl);
   void extract_save_mon_key(KeyRing& keyring);
 
+  void collect_metadata(Metadata *m);
+  int load_metadata();
+  void count_metadata(const std::string& field, ceph::Formatter *f);
+  void count_metadata(const std::string& field, std::map<std::string,int> *out);
+  // get_all_versions() gathers version information from daemons for health check
+  void get_all_versions(std::map<string, std::list<std::string>> &versions);
+  void get_versions(std::map<string, std::list<std::string>> &versions);
+
   // features
+  static CompatSet get_initial_supported_features();
   static CompatSet get_supported_features();
   static CompatSet get_legacy_features();
+  /// read the ondisk features into the CompatSet pointed to by read_features
+  static void read_features_off_disk(MonitorDBStore *store, CompatSet *read_features);
   void read_features();
-  void write_features(MonitorDBStore::Transaction &t);
+  void write_features(MonitorDBStore::TransactionRef t);
+
+  OpTracker op_tracker;
 
  public:
-  Monitor(CephContext *cct_, string nm, MonitorDBStore *s,
-	  Messenger *m, MonMap *map);
-  ~Monitor();
+  Monitor(CephContext *cct_, std::string nm, MonitorDBStore *s,
+	  Messenger *m, Messenger *mgr_m, MonMap *map);
+  ~Monitor() override;
 
   static int check_features(MonitorDBStore *store);
 
+  // config observer
+  const char** get_tracked_conf_keys() const override;
+  void handle_conf_change(const ConfigProxy& conf,
+                          const std::set<std::string> &changed) override;
+
+  void update_log_clients();
+  int sanitize_options();
   int preinit();
   int init();
   void init_paxos();
+  void refresh_from_paxos(bool *need_bootstrap);
   void shutdown();
   void tick();
 
   void handle_signal(int sig);
 
-  int mkfs(bufferlist& osdmapbl);
+  int mkfs(ceph::buffer::list& osdmapbl);
 
   /**
    * check cluster_fsid file
@@ -1432,9 +1025,12 @@ public:
    * @return 0 on success, or negative error code
    */
   int write_fsid();
-  int write_fsid(MonitorDBStore::Transaction &t);
+  int write_fsid(MonitorDBStore::TransactionRef t);
 
-  void do_admin_command(std::string command, std::string args, ostream& ss);
+  int do_admin_command(std::string_view command, const cmdmap_t& cmdmap,
+		       ceph::Formatter *f,
+		       std::ostream& err,
+		       std::ostream& out);
 
 private:
   // don't allow copying
@@ -1442,88 +1038,75 @@ private:
   Monitor& operator=(const Monitor &rhs);
 
 public:
-  class StoreConverter {
-    const string path;
-    boost::scoped_ptr<MonitorDBStore> db;
-    boost::scoped_ptr<MonitorStore> store;
+  static void format_command_descriptions(const std::vector<MonCommand> &commands,
+					  ceph::Formatter *f,
+					  uint64_t features,
+					  ceph::buffer::list *rdata);
 
-    set<version_t> gvs;
-    map<version_t, set<pair<string,version_t> > > gv_map;
-
-    version_t highest_last_pn;
-    version_t highest_accepted_pn;
-
-   public:
-    StoreConverter(const string &path)
-      : path(path), db(NULL), store(NULL),
-	highest_last_pn(0), highest_accepted_pn(0)
-    { }
-
-    /**
-     * Check if store needs to be converted from old format to a
-     * k/v store.
-     *
-     * @returns 0 if store doesn't need conversion; 1 if it does; <0 if error
-     */
-    int needs_conversion();
-    int convert();
-
-   private:
-
-    bool _check_gv_store();
-
-    void _init() {
-      MonitorDBStore *db_ptr = new MonitorDBStore(path);
-      db.reset(db_ptr);
-
-      MonitorStore *store_ptr = new MonitorStore(path);
-      store.reset(store_ptr);
+  const std::vector<MonCommand> &get_local_commands(mon_feature_t f) {
+    if (f.contains_all(ceph::features::mon::FEATURE_NAUTILUS)) {
+      return local_mon_commands;
+    } else {
+      return prenautilus_local_mon_commands;
     }
-
-    void _deinit() {
-      db.reset(NULL);
-      store.reset(NULL);
+  }
+  const ceph::buffer::list& get_local_commands_bl(mon_feature_t f) {
+    if (f.contains_all(ceph::features::mon::FEATURE_NAUTILUS)) {
+      return local_mon_commands_bl;
+    } else {
+      return prenautilus_local_mon_commands_bl;
     }
+  }
+  void set_leader_commands(const std::vector<MonCommand>& cmds) {
+    leader_mon_commands = cmds;
+  }
 
-    set<string> _get_machines_names() {
-      set<string> names;
-      names.insert("auth");
-      names.insert("logm");
-      names.insert("mdsmap");
-      names.insert("monmap");
-      names.insert("osdmap");
-      names.insert("pgmap");
-
-      return names;
-    }
-
-    void _mark_convert_start() {
-      MonitorDBStore::Transaction tx;
-      tx.put("mon_convert", "on_going", 1);
-      db->apply_transaction(tx);
-    }
-
-    void _convert_finish_features(MonitorDBStore::Transaction &t);
-    void _mark_convert_finish() {
-      MonitorDBStore::Transaction tx;
-      tx.erase("mon_convert", "on_going");
-      _convert_finish_features(tx);
-      db->apply_transaction(tx);
-    }
-
-    void _convert_monitor();
-    void _convert_machines(string machine);
-    void _convert_osdmap_full();
-    void _convert_machines();
-    void _convert_paxos();
-  };
+  bool is_keyring_required();
 };
 
 #define CEPH_MON_FEATURE_INCOMPAT_BASE CompatSet::Feature (1, "initial feature set (~v.18)")
 #define CEPH_MON_FEATURE_INCOMPAT_GV CompatSet::Feature (2, "global version sequencing (v0.52)")
 #define CEPH_MON_FEATURE_INCOMPAT_SINGLE_PAXOS CompatSet::Feature (3, "single paxos with k/v store (v0.\?)")
+#define CEPH_MON_FEATURE_INCOMPAT_OSD_ERASURE_CODES CompatSet::Feature(4, "support erasure code pools")
+#define CEPH_MON_FEATURE_INCOMPAT_OSDMAP_ENC CompatSet::Feature(5, "new-style osdmap encoding")
+#define CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V2 CompatSet::Feature(6, "support isa/lrc erasure code")
+#define CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V3 CompatSet::Feature(7, "support shec erasure code")
+#define CEPH_MON_FEATURE_INCOMPAT_KRAKEN CompatSet::Feature(8, "support monmap features")
+#define CEPH_MON_FEATURE_INCOMPAT_LUMINOUS CompatSet::Feature(9, "luminous ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_MIMIC CompatSet::Feature(10, "mimic ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_NAUTILUS CompatSet::Feature(11, "nautilus ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_OCTOPUS CompatSet::Feature(12, "octopus ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_PACIFIC CompatSet::Feature(13, "pacific ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_QUINCY CompatSet::Feature(14, "quincy ondisk layout")
+// make sure you add your feature to Monitor::get_supported_features
 
-long parse_pos_long(const char *s, ostream *pss = NULL);
 
+/* Callers use:
+ *
+ *      new C_MonContext{...}
+ *
+ * instead of
+ *
+ *      new C_MonContext(...)
+ *
+ * because of gcc bug [1].
+ *
+ * [1] https://gcc.gnu.org/bugzilla/show_bug.cgi?id=85883
+ */
+template<typename T>
+class C_MonContext : public LambdaContext<T> {
+public:
+  C_MonContext(const Monitor* m, T&& f) :
+      LambdaContext<T>(std::forward<T>(f)),
+      mon(m)
+  {}
+  void finish(int r) override {
+    if (mon->is_shutdown())
+      return;
+    LambdaContext<T>::finish(r);
+  }
+private:
+  const Monitor* mon;
+};
 
 #endif

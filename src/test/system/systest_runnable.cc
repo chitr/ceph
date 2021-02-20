@@ -12,8 +12,8 @@
  *
  */
 
+#include "include/compat.h"
 #include "common/errno.h"
-#include "include/atomic.h"
 #include "systest_runnable.h"
 #include "systest_settings.h"
 
@@ -25,15 +25,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#ifndef _WIN32
 #include <sys/syscall.h>
-#include <sys/types.h>
 #include <sys/wait.h>
-#include <unistd.h>
-#include <vector>
-
-#if defined(__FreeBSD__)
-#include <pthread_np.h>
 #endif
+#include <sys/types.h>
+#include <unistd.h>
+#include <atomic>
+#include <limits>
+#include <vector>
 
 using std::ostringstream;
 using std::string;
@@ -42,12 +42,14 @@ static pid_t do_gettid(void)
 {
 #if defined(__linux__)
   return static_cast < pid_t >(syscall(SYS_gettid));
+#elif defined(_WIN32)
+  return static_cast < pid_t >(GetCurrentThreadId());
 #else
   return static_cast < pid_t >(pthread_getthreadid_np());
 #endif
 }
 
-ceph::atomic_t m_highest_id(0);
+std::atomic<unsigned> m_highest_id = { 0 };
 
 SysTestRunnable::
 SysTestRunnable(int argc, const char **argv)
@@ -56,9 +58,8 @@ SysTestRunnable(int argc, const char **argv)
     m_argv_orig(NULL)
 {
   m_started = false;
-  m_id = m_highest_id.inc();
+  m_id = ++m_highest_id;
   memset(&m_pthread, 0, sizeof(m_pthread));
-  m_pid = 0;
   update_id_str(false);
   set_argv(argc, argv);
 }
@@ -81,33 +82,34 @@ start()
   if (m_started) {
     return -EDOM;
   }
+  int ret;
   bool use_threads = SysTestSettings::inst().use_threads();
   if (use_threads) {
-    int ret = pthread_create(&m_pthread, NULL, systest_runnable_pthread_helper,
+    ret = pthread_create(&m_pthread, NULL, systest_runnable_pthread_helper,
 			     static_cast<void*>(this));
     if (ret)
       return ret;
     m_started = true;
-    return 0;
-  }
-  else {
-    pid_t pid = fork();
-    if (pid == -1) {
-      int err = errno;
-      return -err;
-    }
-    else if (pid == 0) {
+  } else {
+    #ifdef _WIN32
+    printf("Using separate processes is not supported on Windows.\n");
+    return -1;
+    #else
+    std::string err_msg;
+    ret = preforker.prefork(err_msg);
+    if (ret < 0)
+      preforker.exit(ret);
+
+    if (preforker.is_child()) {
       m_started = true;
-      m_pid = getpid();
       void *retptr = systest_runnable_pthread_helper(static_cast<void*>(this));
-      exit((int)(uintptr_t)retptr);
-    }
-    else {
+      preforker.exit((int)(uintptr_t)retptr);
+    } else {
       m_started = true;
-      m_pid = pid;
-      return 0;
     }
+    #endif
   }
+  return 0;
 }
 
 std::string SysTestRunnable::
@@ -116,10 +118,11 @@ join()
   if (!m_started) {
     return "SysTestRunnable was never started.";
   }
+  int ret;
   bool use_threads = SysTestSettings::inst().use_threads();
   if (use_threads) {
     void *ptrretval;
-    int ret = pthread_join(m_pthread, &ptrretval);
+    ret = pthread_join(m_pthread, &ptrretval);
     if (ret) {
       ostringstream oss;
       oss << "pthread_join failed with error " << ret;
@@ -132,36 +135,14 @@ join()
       return oss.str();
     }
     return "";
-  }
-  else {
-    int status;
-    printf("waitpid(%d)\n", m_pid);
-    pid_t pid = waitpid(m_pid, &status, 0);
-    if (pid == -1) {
-      int err = errno;
-      ostringstream oss;
-      oss << get_id_str() << " waitpid error: " << cpp_strerror(err);
-      return oss.str();
-    }
-    else if (WIFSIGNALED(status)) {
-      ostringstream oss;
-      oss << get_id_str() << " exited with a signal";
-      return oss.str();
-    }
-    else if (!WIFEXITED(status)) {
-      ostringstream oss;
-      oss << get_id_str() << " did not exit normally";
-      return oss.str();
-    }
-    else {
-      int exit_status = WEXITSTATUS(status);
-      if (exit_status != 0) {
-	ostringstream oss;
-	oss << get_id_str() << " returned exit_status " << exit_status;
-	return oss.str();
-      }
-      return "";
-    }
+  } else {
+    #ifdef _WIN32
+    return "Using separate processes is not supported on Windows.\n";
+    #else
+    std::string err_msg;
+    ret = preforker.parent_wait(err_msg);
+    return err_msg;
+    #endif
   }
 }
 
@@ -199,7 +180,9 @@ void *systest_runnable_pthread_helper(void *arg)
 {
   SysTestRunnable *st = static_cast < SysTestRunnable * >(arg);
   st->update_id_str(true);
+  printf("%s: starting.\n", st->get_id_str());
   int ret = st->run();
+  printf("%s: shutting down.\n", st->get_id_str());
   return (void*)(uintptr_t)ret;
 }
 
@@ -207,7 +190,7 @@ void SysTestRunnable::
 update_id_str(bool started)
 {
   bool use_threads = SysTestSettings::inst().use_threads();
-  char extra[128];
+  char extra[std::numeric_limits<int>::digits10 + 1];
   extra[0] = '\0';
 
   if (started) {
@@ -229,9 +212,9 @@ set_argv(int argc, const char **argv)
   if (m_argv_orig != NULL) {
     for (int i = 0; i < m_argc; ++i)
       free((void*)(m_argv_orig[i]));
-    delete m_argv_orig;
+    delete[] m_argv_orig;
     m_argv_orig = NULL;
-    delete m_argv;
+    delete[] m_argv;
     m_argv = NULL;
     m_argc = 0;
   }

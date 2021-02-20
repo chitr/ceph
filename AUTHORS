@@ -1,19 +1,17 @@
-Ceph core
----------
+Maintainer
+----------
+Sage Weil <sage@redhat.com>
 
-Sage Weil <sage@newdream.net>
-Yehuda Sadeh-Weinraub <yehudasa@gmail.com>
-Greg Farnum <gregf@hq.newdream.net>
-
-Kernel client
--------------
-
-Sage Weil <sage@newdream.net>
-Patience Warnick <patience@newdream.net>
-Yehuda Sadeh-Weinraub <yehudasa@gmail.com>
-Greg Farnum <gregf@hq.newdream.net>
+Component Technical Leads
+-------------------------
+For a full list of CTLs and maintainers visit: http://ceph.com/team/
 
 Contributors
 ------------
+For a complete contributor list:
 
-Loic Dachary <loic@dachary.org>
+  git shortlog -sn
+
+For more friendly contributor stats, see:
+
+  http://metrics.ceph.com

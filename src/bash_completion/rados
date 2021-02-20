@@ -31,8 +31,8 @@ _rados()
                 COMPREPLY=( $(compgen -A hostname ${cur}) )
                 return 0
                 ;;
-            *)
-                COMPREPLY=( $(compgen -W "lspools mkpool rmpool df ls chown get put create rm listxattr getxattr setxattr rmxattr stat mapext lssnap mksnap rmsnap rollback bench" -- ${cur}) )
+            rados)
+                COMPREPLY=( $(compgen -W "lspools df ls chown get put create rm listxattr getxattr setxattr rmxattr stat stat2 mapext lssnap mksnap rmsnap rollback bench" -- ${cur}) )
                 return 0
             ;;
         esac

@@ -12,7 +12,7 @@
  * 
  */
 #include "include/Context.h"
-#include "test/unit.h"
+#include "gtest/gtest.h"
 
 class C_Checker : public Context {
 public:
@@ -20,7 +20,7 @@ public:
   int *result;
   C_Checker(bool* _finish_called, int *r) :
     finish_called(_finish_called), result(r) {}
-  void finish(int r) { *finish_called = true; *result = r; }
+  void finish(int r) override { *finish_called = true; *result = r; }
 };
 
 TEST(ContextGather, Constructor) {
@@ -40,8 +40,7 @@ TEST(ContextGather, OneSub) {
   C_Checker *checker = new C_Checker(&finish_called, &result);
   gather.set_finisher(checker);
   gather.activate();
-  sub->finish(0);
-  delete sub;
+  sub->complete(0);
   EXPECT_TRUE(finish_called);
   EXPECT_EQ(0, result);
 }
@@ -63,14 +62,12 @@ TEST(ContextGather, ManySubs) {
 
   //finish all except one sub
   for (int j = 0; j < sub_count - 1; ++j) {
-    subs[j]->finish(0);
-    delete subs[j];
+    subs[j]->complete(0);
     EXPECT_FALSE(finish_called);
   }
 
   //finish last one and check asserts
-  subs[sub_count-1]->finish(0);
-  delete subs[sub_count-1];
+  subs[sub_count-1]->complete(0);
   EXPECT_TRUE(finish_called);
 }
 
@@ -92,16 +89,14 @@ TEST(ContextGather, AlternatingSubCreateFinish) {
 
   //alternate finishing first half of subs and creating last half of subs
   for (int j = 0; j < sub_count / 2; ++j) {
-    subs[j]->finish(0);
-    delete subs[j];
+    subs[j]->complete(0);
     subs[sub_count / 2 + j] = gather.new_sub();
   }
   gather.activate();
 
   //finish last half of subs
   for (int k = sub_count / 2; k < sub_count; ++k) {
-    subs[k]->finish(0);
-    delete subs[k];
+    subs[k]->complete(0);
   }
 
   EXPECT_TRUE(finish_called);

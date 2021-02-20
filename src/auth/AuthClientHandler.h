@@ -17,15 +17,9 @@
 
 
 #include "auth/Auth.h"
+#include "include/common_fwd.h"
 
-#include "common/Mutex.h"
-#include "common/Cond.h"
-
-#include "common/Timer.h"
-
-class CephContext;
-class MAuthReply;
-class AuthClientHandler;
+struct MAuthReply;
 class RotatingKeyRing;
 
 class AuthClientHandler {
@@ -38,52 +32,41 @@ protected:
   uint32_t need;
 
 public:
-  AuthClientHandler(CephContext *cct_) 
-    : cct(cct_), global_id(0), want(CEPH_ENTITY_TYPE_AUTH), have(0), need(0) {}
+  explicit AuthClientHandler(CephContext *cct_)
+    : cct(cct_), global_id(0), want(CEPH_ENTITY_TYPE_AUTH), have(0), need(0)
+  {}
   virtual ~AuthClientHandler() {}
 
-  void init(EntityName& n) { name = n; }
+  void init(const EntityName& n) { name = n; }
   
   void set_want_keys(__u32 keys) {
     want = keys | CEPH_ENTITY_TYPE_AUTH;
     validate_tickets();
   }
-  void add_want_keys(__u32 keys) {
-    want |= keys;
-    validate_tickets();
-  }   
 
-  bool have_keys(__u32 k) {
-    validate_tickets();
-    return (k & have) == have;
-  }
-  bool have_keys() {
-    validate_tickets();
-    return (want & have) == have;
-  }
-
-
-  virtual int get_protocol() = 0;
+  virtual int get_protocol() const = 0;
 
   virtual void reset() = 0;
-  virtual int build_request(bufferlist& bl) = 0;
-  virtual int handle_response(int ret, bufferlist::iterator& iter) = 0;
-  virtual bool build_rotating_request(bufferlist& bl) = 0;
+  virtual void prepare_build_request() = 0;
+  virtual void build_initial_request(ceph::buffer::list *bl) const {
+    // this is empty for methods cephx and none.
+  }
+  virtual int build_request(ceph::buffer::list& bl) const = 0;
+  virtual int handle_response(int ret, ceph::buffer::list::const_iterator& iter,
+			      CryptoKey *session_key,
+			      std::string *connection_secret) = 0;
+  virtual bool build_rotating_request(ceph::buffer::list& bl) const = 0;
 
-  virtual void tick() = 0;
+  virtual AuthAuthorizer *build_authorizer(uint32_t service_id) const = 0;
 
-  virtual AuthAuthorizer *build_authorizer(uint32_t service_id) = 0;
-
-  virtual void validate_tickets() = 0;
   virtual bool need_tickets() = 0;
 
   virtual void set_global_id(uint64_t id) = 0;
-  uint64_t get_global_id() { return global_id; }
+
+  static AuthClientHandler* create(CephContext* cct, int proto, RotatingKeyRing* rkeys);
+protected:
+  virtual void validate_tickets() = 0;
 };
-
-
-extern AuthClientHandler *get_auth_client_handler(CephContext *cct,
-				      int proto, RotatingKeyRing *rkeys);
 
 #endif
 

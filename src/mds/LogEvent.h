@@ -31,47 +31,42 @@
 #define EVENT_SESSIONS     12
 
 #define EVENT_UPDATE       20
-#define EVENT_SLAVEUPDATE  21
+#define EVENT_PEERUPDATE   21
 #define EVENT_OPEN         22
 #define EVENT_COMMITTED    23
+#define EVENT_PURGED       24
 
 #define EVENT_TABLECLIENT  42
 #define EVENT_TABLESERVER  43
 
 #define EVENT_SUBTREEMAP_TEST   50
+#define EVENT_NOOP        51
 
 
-#include <string>
-using namespace std;
-
-#include "include/buffer.h"
+#include "include/buffer_fwd.h"
 #include "include/Context.h"
 #include "include/utime.h"
 
-class MDS;
+class MDSRank;
 class LogSegment;
+class EMetaBlob;
 
 // generic log event
 class LogEvent {
- private:
-  __u32 _type;
-  uint64_t _start_off;
-  static LogEvent *decode_event(bufferlist& bl, bufferlist::iterator& p, __u32 type);
-
-protected:
-  utime_t stamp;
-
+public:
+  typedef __u32 EventType;
   friend class MDLog;
 
- public:
-  LogSegment *_segment;
+  LogEvent() = delete;
+  explicit LogEvent(int t) : _type(t) {}
+  LogEvent(const LogEvent&) = delete;
+  LogEvent& operator=(const LogEvent&) = delete;
+  virtual ~LogEvent() {}
 
-  LogEvent(int t)
-    : _type(t), _start_off(0), _segment(0) { }
-  virtual ~LogEvent() { }
-
-  int get_type() const { return _type; }
-  void set_type(int t) { _type = t; }
+  std::string_view get_type_str() const;
+  static EventType str_to_type(std::string_view str);
+  EventType get_type() const { return _type; }
+  void set_type(EventType t) { _type = t; }
 
   uint64_t get_start_off() const { return _start_off; }
   void set_start_off(uint64_t o) { _start_off = o; }
@@ -80,15 +75,17 @@ protected:
   void set_stamp(utime_t t) { stamp = t; }
 
   // encoding
-  virtual void encode(bufferlist& bl) const = 0;
-  virtual void decode(bufferlist::iterator &bl) = 0;
-  static LogEvent *decode(bufferlist &bl);
+  virtual void encode(bufferlist& bl, uint64_t features) const = 0;
+  virtual void decode(bufferlist::const_iterator &) = 0;
+  static std::unique_ptr<LogEvent> decode_event(bufferlist::const_iterator);
+  virtual void dump(Formatter *f) const = 0;
 
-  void encode_with_header(bufferlist& bl) {
-    ::encode(EVENT_NEW_ENCODING, bl);
+  void encode_with_header(bufferlist& bl, uint64_t features) {
+    using ceph::encode;
+    encode(EVENT_NEW_ENCODING, bl);
     ENCODE_START(1, 1, bl)
-    ::encode(_type, bl);
-    encode(bl);
+    encode(_type, bl);
+    this->encode(bl, features);
     ENCODE_FINISH(bl);
   }
 
@@ -104,12 +101,31 @@ protected:
   /*** recovery ***/
   /* replay() - replay given event.  this is idempotent.
    */
-  virtual void replay(MDS *m) { assert(0); }
+  virtual void replay(MDSRank *m) { ceph_abort(); }
 
+  /**
+   * If the subclass embeds a MetaBlob, return it here so that
+   * tools can examine metablobs while traversing lists of LogEvent.
+   */
+  virtual EMetaBlob *get_metablob() { return NULL; }
 
+protected:
+  LogSegment* get_segment() { return _segment; }
+  LogSegment const* get_segment() const { return _segment; }
+
+  utime_t stamp;
+
+private:
+  static const std::map<std::string, LogEvent::EventType> types;
+
+  static std::unique_ptr<LogEvent> decode_event(bufferlist::const_iterator&, EventType);
+
+  EventType _type = 0;
+  uint64_t _start_off = 0;
+  LogSegment *_segment = nullptr;
 };
 
-inline ostream& operator<<(ostream& out, LogEvent& le) {
+inline ostream& operator<<(ostream& out, const LogEvent &le) {
   le.print(out);
   return out;
 }

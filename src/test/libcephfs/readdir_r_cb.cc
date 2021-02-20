@@ -15,7 +15,7 @@
 #include "gtest/gtest.h"
 #include "include/cephfs/libcephfs.h"
 #include <errno.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 
 TEST(LibCephFS, ReaddirRCB) {
   struct ceph_mount_info *cmount;
@@ -38,6 +38,7 @@ TEST(LibCephFS, ReaddirRCB) {
   sprintf(c_file, "/readdir_r_cb_tests_%d/foo", getpid());
   int fd = ceph_open(cmount, c_file, O_CREAT, 0777);
   ASSERT_LT(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
 
   // check correctness with one entry
   ASSERT_LE(0, ceph_closedir(cmount, dirp));
@@ -54,4 +55,9 @@ TEST(LibCephFS, ReaddirRCB) {
   ASSERT_LE(0, ceph_opendir(cmount, c_dir, &dirp));
   ASSERT_EQ(5, ceph_getdnames(cmount, dirp, buf, 6));
   ASSERT_EQ(4, ceph_getdnames(cmount, dirp, buf, 6));
+
+  // free cmount after finishing testing
+  ASSERT_LE(0, ceph_closedir(cmount, dirp));
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_release(cmount));
 }

@@ -12,13 +12,15 @@
  *
  */
 
+#include "acconfig.h"
+
+#include <gperftools/profiler.h>
+
 #include "common/LogClient.h"
 #include "perfglue/cpu_profiler.h"
 
-#include <google/profiler.h>
-
 void cpu_profiler_handle_command(const std::vector<std::string> &cmd,
-				 ostream& out)
+				 std::ostream& out)
 {
   if (cmd[1] == "status") {
     ProfilerState st;

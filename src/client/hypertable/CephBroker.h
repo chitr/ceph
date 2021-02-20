@@ -27,13 +27,13 @@
 extern "C" {
 #include <unistd.h>
 }
-
+#include <atomic>
 #include "Common/String.h"
-#include "Common/atomic.h"
 #include "Common/Properties.h"
 
 #include "DfsBroker/Lib/Broker.h"
 
+#include <cephfs/libcephfs.h>
 
 namespace Hypertable {
   using namespace DfsBroker;
@@ -57,7 +57,7 @@ namespace Hypertable {
   class OpenFileDataCephPtr : public OpenFileDataPtr {
   public:
     OpenFileDataCephPtr() : OpenFileDataPtr() { }
-    OpenFileDataCephPtr(OpenFileDataCeph *ofdl) : OpenFileDataPtr(ofdl, true) { }
+    explicit OpenFileDataCephPtr(OpenFileDataCeph *ofdl) : OpenFileDataPtr(ofdl, true) { }
     OpenFileDataCeph *operator->() const { return static_cast<OpenFileDataCeph *>(get()); }
   };
 
@@ -66,7 +66,7 @@ namespace Hypertable {
    */
   class CephBroker : public DfsBroker::Broker {
   public:
-    CephBroker(PropertiesPtr& cfg);
+    explicit CephBroker(PropertiesPtr& cfg);
     virtual ~CephBroker();
 
     virtual void open(ResponseCallbackOpen *cb, const char *fname,
@@ -80,9 +80,9 @@ namespace Hypertable {
                         uint32_t amount, const void *data, bool sync);
     virtual void seek(ResponseCallback *cb, uint32_t fd, uint64_t offset);
     virtual void remove(ResponseCallback *cb, const char *fname);
-    virtual void length(ResponseCallbackLength *cb, const char *fname);
+    virtual void length(ResponseCallbackLength *cb, const char *fname, bool);
     virtual void pread(ResponseCallbackRead *cb, uint32_t fd, uint64_t offset,
-                       uint32_t amount);
+                       uint32_t amount, bool);
     virtual void mkdirs(ResponseCallback *cb, const char *dname);
     virtual void rmdir(ResponseCallback *cb, const char *dname);
     virtual void flush(ResponseCallback *cb, uint32_t fd);
@@ -96,7 +96,7 @@ namespace Hypertable {
 
   private:
     struct ceph_mount_info *cmount;
-    static atomic_t ms_next_fd;
+    static std::atomic<int> ms_next_fd;
 
     virtual void report_error(ResponseCallback *cb, int error);
 

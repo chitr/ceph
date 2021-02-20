@@ -2,50 +2,61 @@
  API Documentation
 ===================
 
+Ceph RESTful API
+================
 
-RADOS Object Store APIs
-=======================
+See `Ceph REST API`_.
 
-See `RADOS Object Store APIs`_.
+.. _Ceph REST API: ../mgr/ceph_api/
 
-.. _RADOS Object Store APIs: ../rados/api/
-
-
-CephFS APIs
-===========
-
-See `libcephfs (javadoc)`_.
-
-.. _libcephfs (javadoc): libcephfs-java
-
-
-Ceph Block Device
-=================
-
-See `librbdpy`_. 
-
-.. _librbdpy: ../rbd/librbdpy
-
-
-Ceph RADOS Gateway S3 API
+Ceph Storage Cluster APIs
 =========================
 
-See `S3-compatible API`_.
+See `Ceph Storage Cluster APIs`_.
+
+.. _Ceph Storage Cluster APIs: ../rados/api/
+
+
+Ceph File System APIs
+=====================
+
+See `libcephfs`_
+
+.. _libcephfs: ../cephfs/api
+
+Ceph Block Device APIs
+======================
+
+See `librbdpy`_.
+
+.. _librbdpy: ../rbd/api/librbdpy
+
+Ceph RADOS Gateway APIs
+=======================
+
+See `librgw-py`_.
+
+.. _librgw-py: ../radosgw/api
+
+Ceph Object Store APIs
+======================
+
+- See `S3-compatible API`_.
+- See `Swift-compatible API`_.
+- See `Admin Ops API`_.
+
+Ceph MON Command API
+====================
+
+- See `Mon command API`_.
 
 .. _S3-compatible API: ../radosgw/s3/
-
-
-Ceph RADOS Gateway Swift API
-============================
-
-See `Swift-compatible API`_.
-
 .. _Swift-compatible API: ../radosgw/swift/
-
-
-Ceph RADOS Gateway Admin Ops API
-================================
-
-See `Admin Ops API`_. 
-
 .. _Admin Ops API: ../radosgw/adminops
+.. _Mon command API: mon_command_api
+
+
+.. toctree::
+    :hidden:
+    
+    mon_command_api

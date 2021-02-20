@@ -1,3 +1,5 @@
+:orphan:
+
 =============================================
  ceph-debugpack -- ceph debug packer utility
 =============================================
@@ -36,7 +38,7 @@ Options
 Availability
 ============
 
-**ceph-debugpack** is part of the Ceph distributed file system. Please
+**ceph-debugpack** is part of Ceph, a massively scalable, open-source, distributed storage system. Please
 refer to the Ceph documentation at http://ceph.com/docs for more
 information.
 
@@ -45,3 +47,4 @@ See also
 ========
 
 :doc:`ceph <ceph>`\(8)
+:doc:`ceph-post-file <ceph-post-file>`\(8)

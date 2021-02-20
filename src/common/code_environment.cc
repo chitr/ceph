@@ -14,14 +14,15 @@
 
 #include "common/code_environment.h"
 
-#include <errno.h>
 #include <iostream>
-#include <stdlib.h>
-#include <string.h>
-#include <string>
-#if defined(__linux__)
+
+#include "acconfig.h"
+
+#ifdef HAVE_SYS_PRCTL_H
 #include <sys/prctl.h>
 #endif
+
+#include <string.h>
 
 code_environment_t g_code_env = CODE_ENVIRONMENT_UTILITY;
 
@@ -39,11 +40,13 @@ extern "C" const char *code_environment_to_str(enum code_environment_t e)
   }
 }
 
-std::ostream &operator<<(std::ostream &oss, enum code_environment_t e)
+std::ostream &operator<<(std::ostream &oss, const enum code_environment_t e)
 {
   oss << code_environment_to_str(e);
   return oss;
 }
+
+#if defined(HAVE_SYS_PRCTL_H) && defined(PR_GET_NAME) /* Since 2.6.11 */
 
 int get_process_name(char *buf, int len)
 {
@@ -53,16 +56,62 @@ int get_process_name(char *buf, int len)
      * null-terminated. */
     return -ENAMETOOLONG;
   }
-#if defined(__FreeBSD__)
-#warning XXX
-    return -ENAMETOOLONG;
-#else
+  // FIPS zeroization audit 20191115: this memset is not security related.
   memset(buf, 0, len);
-  int ret;
-  ret = prctl(PR_GET_NAME, buf);
-  return ret;
-#endif
+  return prctl(PR_GET_NAME, buf);
 }
+
+#elif defined(HAVE_GETPROGNAME)
+
+int get_process_name(char *buf, int len)
+{
+  if (len <= 0) {
+    return -EINVAL;
+  }
+
+  const char *progname = getprogname();
+  if (progname == nullptr || *progname == '\0') {
+    return -ENOSYS;
+  }
+
+  strncpy(buf, progname, len - 1);
+  buf[len - 1] = '\0';
+  return 0;
+}
+
+#elif defined(_WIN32)
+
+int get_process_name(char *buf, int len)
+{
+  if (len <= 0) {
+    return -EINVAL;
+  }
+
+  int length = GetModuleFileNameA(nullptr, buf, len);
+  if (length <= 0)
+    return -ENOSYS;
+
+  char* start = strrchr(buf, '\\');
+  if (!start)
+    return -ENOSYS;
+  start++;
+  char* end = strstr(start, ".exe");
+  if (!end)
+    return -ENOSYS;
+
+  memmove(buf, start, end - start);
+  buf[end - start] = '\0';
+  return 0;
+}
+
+#else
+
+int get_process_name(char *buf, int len)
+{
+  return -ENOSYS;
+}
+
+#endif
 
 std::string get_process_name_cpp()
 {

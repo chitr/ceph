@@ -1,14 +1,19 @@
 #include "common/config.h"
 #include "common/signal.h"
 #include "global/signal_handler.h"
+#include "common/debug.h"
+#include "include/coredumpctl.h"
 
-#include "test/unit.h"
+#include "gtest/gtest.h"
 
 #include <errno.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "include/ceph_assert.h"
+
+#define dout_context g_ceph_context
 static volatile sig_atomic_t got_sigusr1 = 0;
 
 static void handle_sigusr1(int signo)
@@ -65,7 +70,7 @@ void testhandler(int signal)
     usr2 = true;
     break;
   default:
-    assert(0 == "unexpected signal");
+    ceph_abort_msg("unexpected signal");
   }
 }
 
@@ -110,3 +115,44 @@ TEST(SignalHandler, Multiple)
   unregister_async_signal_handler(SIGUSR2, testhandler);
   shutdown_async_signal_handler();
 }
+
+TEST(SignalHandler, LogInternal)
+{
+  g_ceph_context->_log->inject_segv();
+  {
+    PrCtl unset_dumpable;
+    ASSERT_DEATH(derr << "foo" << dendl, ".*");
+  }
+  g_ceph_context->_log->reset_segv();
+}
+
+
+/*
+TEST(SignalHandler, MultipleBigFd)
+{
+  int ret;
+
+  for (int i = 0; i < 1500; i++)
+    ::open(".", O_RDONLY);
+
+  reset();
+  init_async_signal_handler();
+  register_async_signal_handler(SIGUSR1, testhandler);
+  register_async_signal_handler(SIGUSR2, testhandler);
+  ASSERT_TRUE(usr1 == false);
+  ASSERT_TRUE(usr2 == false);
+
+  ret = kill(getpid(), SIGUSR1);
+  ASSERT_EQ(ret, 0);
+  ret = kill(getpid(), SIGUSR2);
+  ASSERT_EQ(ret, 0);
+
+  sleep(1);
+  ASSERT_TRUE(usr1 == true);
+  ASSERT_TRUE(usr2 == true);
+
+  unregister_async_signal_handler(SIGUSR1, testhandler);
+  unregister_async_signal_handler(SIGUSR2, testhandler);
+  shutdown_async_signal_handler();
+}
+*/

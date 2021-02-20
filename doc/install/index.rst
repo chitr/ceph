@@ -1,70 +1,68 @@
-==============
- Installation
-==============
+.. _install-overview:
 
-The Ceph Object Store is the foundation of all Ceph clusters, and it consists
-primarily of two types of daemons: Object Storage Daemons (OSDs) and monitors.
-The Ceph Object Store is based upon the concept of 
-:abbr:`RADOS (Reliable Autonomic Distributed Object Store)`, which eliminates
-single points of failure and delivers infinite scalability. For details on 
-the architecture of Ceph and RADOS, refer to `Ceph Architecture`_. All Ceph
-deployments have OSDs and monitors, so you should prepare your Ceph cluster
-by focusing first on the object storage cluster.
+===============
+Installing Ceph
+===============
 
-.. raw:: html
+There are several different ways to install Ceph.  Choose the
+method that best suits your needs.
 
-	<table cellpadding="10"><colgroup><col width="33%"><col width="33%"><col width="33%"></colgroup><tbody valign="top"><tr><td><h3>Recommendations</h3>
-	
-To begin using Ceph in production, you should review our hardware
-recommendations and operating system recommendations. Many of the
-frequently-asked questions in our mailing list involve hardware-related
-questions and how to install Ceph on various distributions. 
+Recommended methods
+~~~~~~~~~~~~~~~~~~~
+
+:ref:`Cephadm <cephadm>` installs and manages a Ceph cluster using containers and
+systemd, with tight integration with the CLI and dashboard GUI.
+
+* cephadm only supports Octopus and newer releases.
+* cephadm is fully integrated with the new orchestration API and
+  fully supports the new CLI and dashboard features to manage
+  cluster deployment.
+* cephadm requires container support (podman or docker) and
+  Python 3.
+
+`Rook <https://rook.io/>`_ deploys and manages Ceph clusters running
+in Kubernetes, while also enabling management of storage resources and
+provisioning via Kubernetes APIs.  We recommend Rook as the way to run Ceph in
+Kubernetes or to connect an existing Ceph storage cluster to Kubernetes.
+
+* Rook only supports Nautilus and newer releases of Ceph.
+* Rook is the preferred method for running Ceph on Kubernetes, or for
+  connecting a Kubernetes cluster to an existing (external) Ceph
+  cluster.
+* Rook supports the new orchestrator API. New management features
+  in the CLI and dashboard are fully supported.
+
+Other methods
+~~~~~~~~~~~~~
+
+`ceph-ansible <https://docs.ceph.com/ceph-ansible/>`_ deploys and manages
+Ceph clusters using Ansible.
+
+* ceph-ansible is widely deployed.
+* ceph-ansible is not integrated with the new orchestrator APIs,
+  introduced in Nautlius and Octopus, which means that newer
+  management features and dashboard integration are not available.
+
+
+`ceph-deploy <https://docs.ceph.com/projects/ceph-deploy/en/latest/>`_ is a tool for quickly deploying clusters.
+
+  .. IMPORTANT::
+
+   ceph-deploy is no longer actively maintained. It is not tested on versions of Ceph newer than Nautilus. It does not support RHEL8, CentOS 8, or newer operating systems.
+
+`ceph-salt <https://github.com/ceph/ceph-salt>`_ installs Ceph using Salt and cephadm.
+
+`jaas.ai/ceph-mon <https://jaas.ai/ceph-mon>`_ installs Ceph using Juju.
+
+`github.com/openstack/puppet-ceph <https://github.com/openstack/puppet-ceph>`_  installs Ceph via Puppet.
+
+Ceph can also be :ref:`installed manually <install-manual>`.
+
 
 .. toctree::
-   :maxdepth: 2
+   :hidden:
 
-   Hardware Recommendations <hardware-recommendations>
-   OS Recommendations <os-recommendations>
-
-.. raw:: html 
-
-	</td><td><h3>Installation</h3>
-
-If you are deploying a Ceph cluster (that is, not developing Ceph),
-install Ceph using our stable release packages. For testing, you 
-may install development release and testing packages.
-
-.. toctree::
-   :maxdepth: 2
-
-   Installing Debian/Ubuntu Packages <debian>
-   Installing RPM Packages <rpm>
-   Upgrading Ceph <upgrading-ceph>
-
-.. raw:: html 
-
-	</td><td><h3>Building Ceph from Source</h3>
-
-You can build Ceph from source by downloading a release or cloning the ``ceph``
-repository at github. If you intend to build Ceph from source, please see the
-build pre-requisites first. Making sure you have all the pre-requisites
-will save you time.
-
-.. toctree::
-   :maxdepth: 1
-
-	Prerequisites <build-prerequisites>
-	Get a Tarball <get-tarballs>
-	Set Up Git <git>
-	Clone the Source <clone-source>
-	Build the Source <building-ceph>
-	Install CPU Profiler <cpu-profiler>
-	Build a Package <build-packages>
-	Contributing Code <contributing>
+   index_manual
 
 
-.. raw:: html
 
-	</td></tr></tbody></table>
-
-.. _Ceph Architecture: ../architecture/

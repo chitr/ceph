@@ -1,13 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
-#wget -q http://ceph.newdream.net/qa/linux-2.6.33.tar.bz2
-wget -q http://ceph.com/qa/linux-3.2.9.tar.bz2
+wget -O linux.tar.gz http://download.ceph.com/qa/linux-5.4.tar.gz
 
 mkdir t
 cd t
-tar jxvf ../linux*.bz2
+tar xzf ../linux.tar.gz
 cd linux*
 make defconfig
 make -j`grep -c processor /proc/cpuinfo`

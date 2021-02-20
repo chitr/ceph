@@ -1,476 +1,354 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+#include "gtest/gtest.h"
+
 #include "mds/mdstypes.h"
+#include "include/err.h"
 #include "include/buffer.h"
 #include "include/rbd_types.h"
+#include "include/rados.h"
 #include "include/rados/librados.h"
 #include "include/rados/librados.hpp"
+#include "include/scope_guard.h"
+#include "include/stringify.h"
+#include "common/Checksummer.h"
+#include "global/global_context.h"
 #include "test/librados/test.h"
-
+#include "test/librados/TestCase.h"
 #include "gtest/gtest.h"
+#include <sys/time.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+
 #include <errno.h>
 #include <map>
 #include <sstream>
 #include <string>
+#include <regex>
 
 using namespace librados;
-using ceph::buffer;
 using std::map;
 using std::ostringstream;
 using std::string;
 
-TEST(LibRadosMisc, Version) {
+typedef RadosTest LibRadosMisc;
+
+TEST(LibRadosMiscVersion, Version) {
   int major, minor, extra;
   rados_version(&major, &minor, &extra);
 }
 
-TEST(LibRadosMisc, VersionPP) {
-  int major, minor, extra;
-  Rados::version(&major, &minor, &extra);
+static void test_rados_log_cb(void *arg,
+                              const char *line,
+                              const char *who,
+                              uint64_t sec, uint64_t nsec,
+                              uint64_t seq, const char *level,
+                              const char *msg)
+{
+    std::cerr << "monitor log callback invoked" << std::endl;
 }
 
-TEST(LibRadosMisc, ClusterFSID) {
+TEST(LibRadosMiscConnectFailure, ConnectFailure) {
   rados_t cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool(pool_name, &cluster));
 
+  char *id = getenv("CEPH_CLIENT_ID");
+  if (id)
+    std::cerr << "Client id is: " << id << std::endl;
+
+  ASSERT_EQ(0, rados_create(&cluster, NULL));
+  ASSERT_EQ(0, rados_conf_read_file(cluster, NULL));
+  ASSERT_EQ(0, rados_conf_parse_env(cluster, NULL));
+
+  ASSERT_EQ(0, rados_conf_set(cluster, "client_mount_timeout", "0.000000001"));
+  ASSERT_EQ(0, rados_conf_set(cluster, "debug_monc", "20"));
+  ASSERT_EQ(0, rados_conf_set(cluster, "debug_ms", "1"));
+  ASSERT_EQ(0, rados_conf_set(cluster, "log_to_stderr", "true"));
+
+  ASSERT_EQ(-ENOTCONN, rados_monitor_log(cluster, "error",
+                                         test_rados_log_cb, NULL));
+
+  // try this a few times; sometimes we don't schedule fast enough for the
+  // cond to time out
+  int r;
+  for (unsigned i=0; i<16; ++i) {
+    cout << i << std::endl;
+    r = rados_connect(cluster);
+    if (r < 0)
+      break;  // yay, we timed out
+    // try again
+    rados_shutdown(cluster);
+    ASSERT_EQ(0, rados_create(&cluster, NULL));
+  }
+  ASSERT_NE(0, r);
+
+  rados_shutdown(cluster);
+}
+
+TEST(LibRadosMiscPool, PoolCreationRace) {
+  rados_t cluster_a, cluster_b;
+
+  char *id = getenv("CEPH_CLIENT_ID");
+  if (id)
+    std::cerr << "Client id is: " << id << std::endl;
+
+  ASSERT_EQ(0, rados_create(&cluster_a, NULL));
+  ASSERT_EQ(0, rados_conf_read_file(cluster_a, NULL));
+  // kludge: i want to --log-file foo and only get cluster b
+  //ASSERT_EQ(0, rados_conf_parse_env(cluster_a, NULL));
+  ASSERT_EQ(0, rados_conf_set(cluster_a,
+			      "objecter_debug_inject_relock_delay", "true"));
+  ASSERT_EQ(0, rados_connect(cluster_a));
+
+  ASSERT_EQ(0, rados_create(&cluster_b, NULL));
+  ASSERT_EQ(0, rados_conf_read_file(cluster_b, NULL));
+  ASSERT_EQ(0, rados_conf_parse_env(cluster_b, NULL));
+  ASSERT_EQ(0, rados_connect(cluster_b));
+
+  char poolname[80];
+  snprintf(poolname, sizeof(poolname), "poolrace.%d", rand());
+  rados_pool_create(cluster_a, poolname);
+  rados_ioctx_t a;
+  rados_ioctx_create(cluster_a, poolname, &a);
+
+  char pool2name[80];
+  snprintf(pool2name, sizeof(pool2name), "poolrace2.%d", rand());
+  rados_pool_create(cluster_b, pool2name);
+
+  list<rados_completion_t> cls;
+  // this should normally trigger pretty easily, but we need to bound
+  // the requests because if we get too many we'll get stuck by always
+  // sending enough messages that we hit the socket failure injection.
+  int max = 512;
+  while (max--) {
+    char buf[100];
+    rados_completion_t c;
+    rados_aio_create_completion2(nullptr, nullptr, &c);
+    cls.push_back(c);
+    rados_aio_read(a, "PoolCreationRaceObj", c, buf, 100, 0);
+    cout << "started " << (void*)c << std::endl;
+    if (rados_aio_is_complete(cls.front())) {
+      break;
+    }
+  }
+  while (!rados_aio_is_complete(cls.front())) {
+    cout << "waiting 1 sec" << std::endl;
+    sleep(1);
+  }
+
+  cout << " started " << cls.size() << " aios" << std::endl;
+  for (auto c : cls) {
+    cout << "waiting " << (void*)c << std::endl;
+    rados_aio_wait_for_complete_and_cb(c);
+    rados_aio_release(c);
+  }
+  cout << "done." << std::endl;
+
+  rados_ioctx_destroy(a);
+  rados_pool_delete(cluster_a, poolname);
+  rados_pool_delete(cluster_a, pool2name);
+  rados_shutdown(cluster_b);
+  rados_shutdown(cluster_a);
+}
+
+TEST_F(LibRadosMisc, ClusterFSID) {
   char fsid[37];
   ASSERT_EQ(-ERANGE, rados_cluster_fsid(cluster, fsid, sizeof(fsid) - 1));
   ASSERT_EQ(sizeof(fsid) - 1,
             (size_t)rados_cluster_fsid(cluster, fsid, sizeof(fsid)));
-
-  ASSERT_EQ(0, destroy_one_pool(pool_name, &cluster));
 }
 
-static std::string read_key_from_tmap(IoCtx& ioctx, const std::string &obj,
-				      const std::string &key)
-{
-  bufferlist bl;
-  int r = ioctx.read(obj, bl, 0, 0);
-  if (r <= 0) {
-    ostringstream oss;
-    oss << "ioctx.read(" << obj << ", bl, 0, 0) returned " << r;
-    return oss.str();
-  }
-  bufferlist::iterator p = bl.begin();
-  bufferlist header;
-  map<string, bufferlist> m;
-  ::decode(header, p);
-  ::decode(m, p);
-  map<string, bufferlist>::iterator i = m.find(key);
-  if (i == m.end())
-    return "";
-  std::string retstring;
-  ::decode(retstring, i->second);
-  return retstring;
-}
-
-static std::string add_key_to_tmap(IoCtx &ioctx, const std::string &obj,
-	  const std::string &key, const std::string &val)
-{
-  __u8 c = CEPH_OSD_TMAP_SET;
-
-  bufferlist tmbl;
-  ::encode(c, tmbl);
-  ::encode(key, tmbl);
-  bufferlist blbl;
-  ::encode(val, blbl);
-  ::encode(blbl, tmbl);
-  int ret = ioctx.tmap_update(obj, tmbl);
-  if (ret) {
-    ostringstream oss;
-    oss << "ioctx.tmap_update(obj=" << obj << ", key="
-	<< key << ", val=" << val << ") failed with error " << ret;
-    return oss.str();
-  }
-  return "";
-}
-
-static int remove_key_from_tmap(IoCtx &ioctx, const std::string &obj,
-					const std::string &key)
-{
-  __u8 c = CEPH_OSD_TMAP_RM;
-
-  bufferlist tmbl;
-  ::encode(c, tmbl);
-  ::encode(key, tmbl);
-  int ret = ioctx.tmap_update(obj, tmbl);
-  if (ret) {
-    ostringstream oss;
-    oss << "ioctx.tmap_update(obj=" << obj << ", key="
-	<< key << ") failed with error " << ret;
-  }
-  return ret;
-}
-
-TEST(LibRadosMisc, TmapUpdatePP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  cluster.ioctx_create(pool_name.c_str(), ioctx);
-
-  // create tmap
-  {
-    __u8 c = CEPH_OSD_TMAP_CREATE;
-    std::string my_tmap("my_tmap");
-    bufferlist emptybl;
-
-    bufferlist tmbl;
-    ::encode(c, tmbl);
-    ::encode(my_tmap, tmbl);
-    ::encode(emptybl, tmbl);
-    ASSERT_EQ(0, ioctx.tmap_update("foo", tmbl));
-  }
-
-  ASSERT_EQ(string(""), add_key_to_tmap(ioctx, "foo", "key1", "val1"));
-
-  ASSERT_EQ(string(""), add_key_to_tmap(ioctx, "foo", "key2", "val2"));
-
-  // read key1 from the tmap
-  ASSERT_EQ(string("val1"), read_key_from_tmap(ioctx, "foo", "key1"));
-
-  // remove key1 from tmap
-  ASSERT_EQ(0, remove_key_from_tmap(ioctx, "foo", "key1"));
-  ASSERT_EQ(-ENOENT, remove_key_from_tmap(ioctx, "foo", "key1"));
-
-  // key should be removed
-  ASSERT_EQ(string(""), read_key_from_tmap(ioctx, "foo", "key1"));
-
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-TEST(LibRadosMisc, TmapUpdateMisorderedPP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  cluster.ioctx_create(pool_name.c_str(), ioctx);
-
-  // create tmap
-  {
-    __u8 c = CEPH_OSD_TMAP_CREATE;
-    std::string my_tmap("my_tmap");
-    bufferlist emptybl;
-
-    bufferlist tmbl;
-    ::encode(c, tmbl);
-    ::encode(my_tmap, tmbl);
-    ::encode(emptybl, tmbl);
-    ASSERT_EQ(0, ioctx.tmap_update("foo", tmbl));
-  }
-
-  // good update
-  {
-    __u8 c = CEPH_OSD_TMAP_SET;
-    bufferlist tmbl;
-    ::encode(c, tmbl);
-    ::encode("a", tmbl);
-    bufferlist blbl;
-    ::encode("old", blbl);
-    ::encode(blbl, tmbl);
-
-    ::encode(c, tmbl);
-    ::encode("b", tmbl);
-    ::encode(blbl, tmbl);
-
-    ::encode(c, tmbl);
-    ::encode("c", tmbl);
-    ::encode(blbl, tmbl);
-
-    ASSERT_EQ(0, ioctx.tmap_update("foo", tmbl));
-  }
-
-  // bad update
-  {
-    __u8 c = CEPH_OSD_TMAP_SET;
-    bufferlist tmbl;
-    ::encode(c, tmbl);
-    ::encode("b", tmbl);
-    bufferlist blbl;
-    ::encode("new", blbl);
-    ::encode(blbl, tmbl);
-
-    ::encode(c, tmbl);
-    ::encode("a", tmbl);
-    ::encode(blbl, tmbl);
-
-    ::encode(c, tmbl);
-    ::encode("c", tmbl);
-    ::encode(blbl, tmbl);
-
-    ASSERT_EQ(0, ioctx.tmap_update("foo", tmbl));
-  }
-
-  // check
-  ASSERT_EQ(string("new"), read_key_from_tmap(ioctx, "foo", "a"));
-  ASSERT_EQ(string("new"), read_key_from_tmap(ioctx, "foo", "b"));
-  ASSERT_EQ(string("new"), read_key_from_tmap(ioctx, "foo", "c"));
-
-  ASSERT_EQ(0, remove_key_from_tmap(ioctx, "foo", "a"));
-  ASSERT_EQ(string(""), read_key_from_tmap(ioctx, "foo", "a"));
-
-  ASSERT_EQ(0, remove_key_from_tmap(ioctx, "foo", "b"));
-  ASSERT_EQ(string(""), read_key_from_tmap(ioctx, "foo", "a"));
-
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-TEST(LibRadosMisc, TmapUpdateMisorderedPutPP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  cluster.ioctx_create(pool_name.c_str(), ioctx);
-
-  // create unsorted tmap
-  string h("header");
-  bufferlist bl;
-  ::encode(h, bl);
-  uint32_t n = 3;
-  ::encode(n, bl);
-  ::encode(string("b"), bl);
-  ::encode(string("bval"), bl);
-  ::encode(string("a"), bl);
-  ::encode(string("aval"), bl);
-  ::encode(string("c"), bl);
-  ::encode(string("cval"), bl);
-  bufferlist orig = bl;  // tmap_put steals bl content
-  ASSERT_EQ(0, ioctx.tmap_put("foo", bl));
-
-  // check
-  bufferlist newbl;
-  ioctx.read("foo", newbl, orig.length(), 0);
-  ASSERT_EQ(orig.contents_equal(newbl), false);
-
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-TEST(LibRadosMisc, Exec) {
+TEST_F(LibRadosMisc, Exec) {
   char buf[128];
-  rados_t cluster;
-  rados_ioctx_t ioctx;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool(pool_name, &cluster));
-  rados_ioctx_create(cluster, pool_name.c_str(), &ioctx);
   memset(buf, 0xcc, sizeof(buf));
-  ASSERT_EQ((int)sizeof(buf), rados_write(ioctx, "foo", buf, sizeof(buf), 0));
+  ASSERT_EQ(0, rados_write(ioctx, "foo", buf, sizeof(buf), 0));
   char buf2[512];
   int res = rados_exec(ioctx, "foo", "rbd", "get_all_features",
 			  NULL, 0, buf2, sizeof(buf2));
   ASSERT_GT(res, 0);
   bufferlist bl;
   bl.append(buf2, res);
-  bufferlist::iterator iter = bl.begin();
+  auto iter = bl.cbegin();
   uint64_t all_features;
-  ::decode(all_features, iter);
-  ASSERT_EQ(all_features, (uint64_t)RBD_FEATURES_ALL);
-  rados_ioctx_destroy(ioctx);
-  ASSERT_EQ(0, destroy_one_pool(pool_name, &cluster));
+  decode(all_features, iter);
+  // make sure *some* features are specified; don't care which ones
+  ASSERT_NE(all_features, (unsigned)0);
 }
 
-TEST(LibRadosMisc, ExecPP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  cluster.ioctx_create(pool_name.c_str(), ioctx);
-  bufferlist bl;
-  ASSERT_EQ(0, ioctx.write("foo", bl, 0, 0));
-  bufferlist bl2, out;
-  int r = ioctx.exec("foo", "rbd", "get_all_features", bl2, out);
-  ASSERT_EQ(0, r);
-  bufferlist::iterator iter = out.begin();
-  uint64_t all_features;
-  ::decode(all_features, iter);
-  ASSERT_EQ(all_features, (uint64_t)RBD_FEATURES_ALL);
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-TEST(LibRadosMisc, Operate1PP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  cluster.ioctx_create(pool_name.c_str(), ioctx);
-
-  ObjectWriteOperation o;
-  {
-    bufferlist bl;
-    o.write(0, bl);
-  }
-  std::string val1("val1");
-  {
-    bufferlist bl;
-    bl.append(val1.c_str(), val1.size() + 1);
-    o.setxattr("key1", bl);
-  }
-  ASSERT_EQ(0, ioctx.operate("foo", &o));
-
-  ObjectWriteOperation empty;
-  ASSERT_EQ(0, ioctx.operate("foo", &empty));
-
-  {
-    bufferlist bl;
-    ASSERT_GT(ioctx.getxattr("foo", "key1", bl), 0);
-    ASSERT_EQ(0, strcmp(bl.c_str(), val1.c_str()));
-  }
-  ObjectWriteOperation o2;
-  {
-    bufferlist bl;
-    bl.append(val1);
-    o2.cmpxattr("key1", CEPH_OSD_CMPXATTR_OP_EQ, bl);
-    o2.rmxattr("key1");
-  }
-  ASSERT_EQ(0, ioctx.operate("foo", &o2));
-  ObjectWriteOperation o3;
-  {
-    bufferlist bl;
-    bl.append(val1);
-    o3.cmpxattr("key1", CEPH_OSD_CMPXATTR_OP_EQ, bl);
-  }
-  ASSERT_LT(ioctx.operate("foo", &o3), 0);
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-TEST(LibRadosMisc, Operate2PP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  cluster.ioctx_create(pool_name.c_str(), ioctx);
-
-  ObjectWriteOperation o;
-  {
-    bufferlist bl;
-    bl.append("abcdefg");
-    o.write(0, bl);
-  }
-  std::string val1("val1");
-  {
-    bufferlist bl;
-    bl.append(val1.c_str(), val1.size() + 1);
-    o.setxattr("key1", bl);
-    o.truncate(0);
-  }
-  ASSERT_EQ(0, ioctx.operate("foo", &o));
-  uint64_t size;
-  time_t mtime;
-  ASSERT_EQ(0, ioctx.stat("foo", &size, &mtime));
-  ASSERT_EQ(0U, size);
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-void set_completion_complete(rados_completion_t cb, void *arg)
-{
-  bool *my_aio_complete = (bool*)arg;
-  *my_aio_complete = true;
-}
-
-TEST(LibRadosMisc, AioOperatePP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  cluster.ioctx_create(pool_name.c_str(), ioctx);
-
-  bool my_aio_complete = false;
-  AioCompletion *my_completion = cluster.aio_create_completion(
-	  (void*)&my_aio_complete, set_completion_complete, NULL);
-  AioCompletion *my_completion_null = NULL;
-  ASSERT_NE(my_completion, my_completion_null);
-
-  ObjectWriteOperation o;
-  {
-    bufferlist bl;
-    o.write(0, bl);
-  }
-  std::string val1("val1");
-  {
-    bufferlist bl;
-    bl.append(val1.c_str(), val1.size() + 1);
-    o.setxattr("key1", bl);
-    bufferlist bl2;
-    char buf2[1024];
-    memset(buf2, 0xdd, sizeof(buf2));
-    bl2.append(buf2, sizeof(buf2));
-    o.append(bl2);
-  }
-  ASSERT_EQ(0, ioctx.aio_operate("foo", my_completion, &o));
-  ASSERT_EQ(0, my_completion->wait_for_complete_and_cb());
-  ASSERT_EQ(my_aio_complete, true);
-
-  uint64_t size;
-  time_t mtime;
-  ASSERT_EQ(0, ioctx.stat("foo", &size, &mtime));
-  ASSERT_EQ(1024U, size);
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-TEST(LibRadosMisc, CloneRangePP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  ASSERT_EQ(0, cluster.ioctx_create(pool_name.c_str(), ioctx));
-  char buf[64];
-  memset(buf, 0xcc, sizeof(buf));
-  bufferlist bl;
-  bl.append(buf, sizeof(buf));
-  ASSERT_EQ(sizeof(buf), (size_t)ioctx.write("foo", bl, sizeof(buf), 0));
-  ioctx.locator_set_key("foo");
-  ASSERT_EQ(0, ioctx.clone_range("bar", 0, "foo", 0, sizeof(buf)));
-  bufferlist bl2;
-  ASSERT_EQ(sizeof(buf), (size_t)ioctx.read("bar", bl2, sizeof(buf), 0));
-  ASSERT_EQ(0, memcmp(buf, bl2.c_str(), sizeof(buf)));
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
-}
-
-TEST(LibRadosMisc, CloneRange) {
+TEST_F(LibRadosMisc, WriteSame) {
   char buf[128];
-  rados_t cluster;
-  rados_ioctx_t ioctx;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool(pool_name, &cluster));
-  rados_ioctx_create(cluster, pool_name.c_str(), &ioctx);
+  char full[128 * 4];
+  char *cmp;
+
+  /* zero the full range before using writesame */
+  memset(full, 0, sizeof(full));
+  ASSERT_EQ(0, rados_write(ioctx, "ws", full, sizeof(full), 0));
+
   memset(buf, 0xcc, sizeof(buf));
-  ASSERT_EQ((int)sizeof(buf), rados_write(ioctx, "src", buf, sizeof(buf), 0));
-  rados_ioctx_locator_set_key(ioctx, "src");
-  ASSERT_EQ(0, rados_clone_range(ioctx, "dst", 0, "src", 0, sizeof(buf)));
-  char buf2[sizeof(buf)];
-  memset(buf2, 0, sizeof(buf2));
-  ASSERT_EQ((int)sizeof(buf2), rados_read(ioctx, "dst", buf2, sizeof(buf2), 0));
-  ASSERT_EQ(0, memcmp(buf, buf2, sizeof(buf)));
-  rados_ioctx_destroy(ioctx);
-  ASSERT_EQ(0, destroy_one_pool(pool_name, &cluster));
+  /* write the same buf four times */
+  ASSERT_EQ(0, rados_writesame(ioctx, "ws", buf, sizeof(buf), sizeof(full), 0));
+
+  /* read back the full buffer and confirm that it matches */
+  ASSERT_EQ((int)sizeof(full), rados_read(ioctx, "ws", full, sizeof(full), 0));
+
+  for (cmp = full; cmp < full + sizeof(full); cmp += sizeof(buf)) {
+    ASSERT_EQ(0, memcmp(cmp, buf, sizeof(buf)));
+  }
+
+  /* write_len not a multiple of data_len should throw error */
+  ASSERT_EQ(-EINVAL, rados_writesame(ioctx, "ws", buf, sizeof(buf),
+				     (sizeof(buf) * 4) - 1, 0));
+  ASSERT_EQ(-EINVAL,
+	    rados_writesame(ioctx, "ws", buf, sizeof(buf), sizeof(buf) / 2, 0));
+  ASSERT_EQ(-EINVAL,
+	    rados_writesame(ioctx, "ws", buf, 0, sizeof(buf), 0));
+  /* write_len = data_len, i.e. same as rados_write() */
+  ASSERT_EQ(0, rados_writesame(ioctx, "ws", buf, sizeof(buf), sizeof(buf), 0));
 }
 
-TEST(LibRadosMisc, AssertExistsPP) {
-  Rados cluster;
-  std::string pool_name = get_temp_pool_name();
-  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
-  IoCtx ioctx;
-  ASSERT_EQ(0, cluster.ioctx_create(pool_name.c_str(), ioctx));
+TEST_F(LibRadosMisc, CmpExt) {
+  bufferlist cmp_bl, bad_cmp_bl, write_bl;
+  char stored_str[] = "1234567891";
+  char mismatch_str[] = "1234577777";
 
-  char buf[64];
-  memset(buf, 0xcc, sizeof(buf));
-  bufferlist bl;
-  bl.append(buf, sizeof(buf));
+  ASSERT_EQ(0,
+	    rados_write(ioctx, "cmpextpp", stored_str, sizeof(stored_str), 0));
 
-  ObjectWriteOperation op;
-  op.assert_exists();
-  op.write(0, bl);
-  ASSERT_EQ(-ENOENT, ioctx.operate("asdffoo", &op));
-  ASSERT_EQ(0, ioctx.create("asdffoo", true));
-  ASSERT_EQ(0, ioctx.operate("asdffoo", &op));
-  ASSERT_EQ(-EEXIST, ioctx.create("asdffoo", true));
+  ASSERT_EQ(0,
+	    rados_cmpext(ioctx, "cmpextpp", stored_str, sizeof(stored_str), 0));
 
-  ioctx.close();
-  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
+  ASSERT_EQ(-MAX_ERRNO - 5,
+	    rados_cmpext(ioctx, "cmpextpp", mismatch_str, sizeof(mismatch_str), 0));
 }
+
+TEST_F(LibRadosMisc, Applications) {
+  const char *cmd[] = {"{\"prefix\":\"osd dump\"}", nullptr};
+  char *buf, *st;
+  size_t buflen, stlen;
+  ASSERT_EQ(0, rados_mon_command(cluster, (const char **)cmd, 1, "", 0, &buf,
+                                 &buflen, &st, &stlen));
+  ASSERT_LT(0u, buflen);
+  string result(buf);
+  rados_buffer_free(buf);
+  rados_buffer_free(st);
+  if (!std::regex_search(result, std::regex("require_osd_release [l-z]"))) {
+    std::cout << "SKIPPING";
+    return;
+  }
+
+  char apps[128];
+  size_t app_len;
+
+  app_len = sizeof(apps);
+  ASSERT_EQ(0, rados_application_list(ioctx, apps, &app_len));
+  ASSERT_EQ(6U, app_len);
+  ASSERT_EQ(0, memcmp("rados\0", apps, app_len));
+
+  ASSERT_EQ(0, rados_application_enable(ioctx, "app1", 1));
+  ASSERT_EQ(-EPERM, rados_application_enable(ioctx, "app2", 0));
+  ASSERT_EQ(0, rados_application_enable(ioctx, "app2", 1));
+
+  ASSERT_EQ(-ERANGE, rados_application_list(ioctx, apps, &app_len));
+  ASSERT_EQ(16U, app_len);
+  ASSERT_EQ(0, rados_application_list(ioctx, apps, &app_len));
+  ASSERT_EQ(16U, app_len);
+  ASSERT_EQ(0, memcmp("app1\0app2\0rados\0", apps, app_len));
+
+  char keys[128];
+  char vals[128];
+  size_t key_len;
+  size_t val_len;
+
+  key_len = sizeof(keys);
+  val_len = sizeof(vals);
+  ASSERT_EQ(-ENOENT, rados_application_metadata_list(ioctx, "dne", keys,
+                                                     &key_len, vals, &val_len));
+  ASSERT_EQ(0, rados_application_metadata_list(ioctx, "app1", keys, &key_len,
+                                               vals, &val_len));
+  ASSERT_EQ(0U, key_len);
+  ASSERT_EQ(0U, val_len);
+
+  ASSERT_EQ(-ENOENT, rados_application_metadata_set(ioctx, "dne", "key",
+                                                    "value"));
+  ASSERT_EQ(0, rados_application_metadata_set(ioctx, "app1", "key1", "value1"));
+  ASSERT_EQ(0, rados_application_metadata_set(ioctx, "app1", "key2", "value2"));
+
+  ASSERT_EQ(-ERANGE, rados_application_metadata_list(ioctx, "app1", keys,
+                                                     &key_len, vals, &val_len));
+  ASSERT_EQ(10U, key_len);
+  ASSERT_EQ(14U, val_len);
+  ASSERT_EQ(0, rados_application_metadata_list(ioctx, "app1", keys, &key_len,
+                                               vals, &val_len));
+  ASSERT_EQ(10U, key_len);
+  ASSERT_EQ(14U, val_len);
+  ASSERT_EQ(0, memcmp("key1\0key2\0", keys, key_len));
+  ASSERT_EQ(0, memcmp("value1\0value2\0", vals, val_len));
+
+  ASSERT_EQ(0, rados_application_metadata_remove(ioctx, "app1", "key1"));
+  ASSERT_EQ(0, rados_application_metadata_list(ioctx, "app1", keys, &key_len,
+                                               vals, &val_len));
+  ASSERT_EQ(5U, key_len);
+  ASSERT_EQ(7U, val_len);
+  ASSERT_EQ(0, memcmp("key2\0", keys, key_len));
+  ASSERT_EQ(0, memcmp("value2\0", vals, val_len));
+}
+
+TEST_F(LibRadosMisc, MinCompatOSD) {
+  int8_t require_osd_release;
+  ASSERT_EQ(0, rados_get_min_compatible_osd(cluster, &require_osd_release));
+  ASSERT_LE(-1, require_osd_release);
+  ASSERT_GT(CEPH_RELEASE_MAX, require_osd_release);
+}
+
+TEST_F(LibRadosMisc, MinCompatClient) {
+  int8_t min_compat_client;
+  int8_t require_min_compat_client;
+  ASSERT_EQ(0, rados_get_min_compatible_client(cluster,
+                                               &min_compat_client,
+                                               &require_min_compat_client));
+  ASSERT_LE(-1, min_compat_client);
+  ASSERT_GT(CEPH_RELEASE_MAX, min_compat_client);
+
+  ASSERT_LE(-1, require_min_compat_client);
+  ASSERT_GT(CEPH_RELEASE_MAX, require_min_compat_client);
+}
+
+static void shutdown_racer_func()
+{
+  const int niter = 32;
+  rados_t rad;
+  int i;
+
+  for (i = 0; i < niter; ++i) {
+    auto r = connect_cluster(&rad);
+    if (getenv("ALLOW_TIMEOUTS")) {
+      ASSERT_TRUE(r == "" || r == "rados_connect failed with error -110");
+    } else {
+      ASSERT_EQ("", r);
+    }
+    rados_shutdown(rad);
+  }
+}
+
+#ifndef _WIN32
+// See trackers #20988 and #42026
+TEST_F(LibRadosMisc, ShutdownRace)
+{
+  const int nthreads = 128;
+  std::thread threads[nthreads];
+
+  // Need a bunch of fd's for this test
+  struct rlimit rold, rnew;
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &rold), 0);
+  rnew = rold;
+  rnew.rlim_cur = rnew.rlim_max;
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &rnew), 0);
+
+  for (int i = 0; i < nthreads; ++i)
+    threads[i] = std::thread(shutdown_racer_func);
+
+  for (int i = 0; i < nthreads; ++i)
+    threads[i].join();
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &rold), 0);
+}
+#endif /* _WIN32 */

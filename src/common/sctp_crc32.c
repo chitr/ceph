@@ -30,8 +30,9 @@
 
 /* $KAME: sctp_crc32.c,v 1.12 2005/03/06 16:04:17 itojun Exp $	 */
 
-
+#ifdef HAVE_SYS_TYPES_H
 #include <sys/cdefs.h>
+#endif
 #if 0
 __FBSDID("$FreeBSD: src/sys/netinet/sctp_crc32.c,v 1.8 2007/05/08 17:01:10 rrs Exp $");
 
@@ -42,11 +43,7 @@ __FBSDID("$FreeBSD: src/sys/netinet/sctp_crc32.c,v 1.8 2007/05/08 17:01:10 rrs E
 
 #include <stdint.h>
 
-#if defined(__FreeBSD__)
-#include <sys/endian.h>
-#else
-#include <endian.h>
-#endif
+#include "acconfig.h"
 
 #ifndef SCTP_USE_ADLER32
 
@@ -65,7 +62,7 @@ __FBSDID("$FreeBSD: src/sys/netinet/sctp_crc32.c,v 1.8 2007/05/08 17:01:10 rrs E
  *				non-NULL if the mode argument is equal to CONT or END
  *		p_buf - the packet buffer where crc computations are being performed
  *		length - the length of p_buf in bytes
- *		init_bytes - the number of initial bytes that need to be procesed before
+ *		init_bytes - the number of initial bytes that need to be processed before
  *					 aligning p_buf to multiples of 4 bytes
  *		mode - can be any of the following: BEGIN, CONT, END, BODY, ALIGN
  *
@@ -541,7 +538,7 @@ sctp_crc32c_sb8_64_bit(uint32_t crc,
 		crc = sctp_crc_tableil8_o32[(crc ^ *p_buf++) & 0x000000FF] ^
 		    (crc >> 8);
 	for (li = 0; li < running_length / 8; li++) {
-#if BYTE_ORDER == BIG_ENDIAN
+#ifdef CEPH_BIG_ENDIAN
 		crc ^= *p_buf++;
 		crc ^= (*p_buf++) << 8;
 		crc ^= (*p_buf++) << 16;
@@ -557,7 +554,7 @@ sctp_crc32c_sb8_64_bit(uint32_t crc,
 		    sctp_crc_tableil8_o72[term2 & 0x000000FF] ^
 		    sctp_crc_tableil8_o64[(term2 >> 8) & 0x000000FF];
 
-#if BYTE_ORDER == BIG_ENDIAN
+#ifdef CEPH_BIG_ENDIAN
 		crc ^= sctp_crc_tableil8_o56[*p_buf++];
 		crc ^= sctp_crc_tableil8_o48[*p_buf++];
 		crc ^= sctp_crc_tableil8_o40[*p_buf++];
@@ -576,6 +573,58 @@ sctp_crc32c_sb8_64_bit(uint32_t crc,
 	}
 	for (li = 0; li < end_bytes; li++)
 		crc = sctp_crc_tableil8_o32[(crc ^ *p_buf++) & 0x000000FF] ^
+		    (crc >> 8);
+	return crc;
+}
+
+static uint32_t
+sctp_crc32c_sb8_64_bit_zero(uint32_t crc,
+    uint32_t length,
+    uint32_t offset)
+{
+	uint32_t li;
+	uint32_t term1, term2;
+	uint32_t running_length;
+	uint32_t end_bytes;
+	uint32_t init_bytes;
+
+	init_bytes = (4-offset) & 0x3;
+
+	if (init_bytes > length)
+		init_bytes = length;
+
+	running_length = ((length - init_bytes) / 8) * 8;
+	end_bytes = length - init_bytes - running_length;
+
+	for (li = 0; li < init_bytes; li++)
+		crc = sctp_crc_tableil8_o32[crc & 0x000000FF] ^
+		    (crc >> 8);
+	for (li = 0; li < running_length / 8; li++) {
+		term1 = sctp_crc_tableil8_o88[crc & 0x000000FF] ^
+		    sctp_crc_tableil8_o80[(crc >> 8) & 0x000000FF];
+		term2 = crc >> 16;
+		crc = term1 ^
+		    sctp_crc_tableil8_o72[term2 & 0x000000FF] ^
+		    sctp_crc_tableil8_o64[(term2 >> 8) & 0x000000FF];
+
+#ifdef CEPH_BIG_ENDIAN
+		crc ^= sctp_crc_tableil8_o56[0];
+		crc ^= sctp_crc_tableil8_o48[0];
+		crc ^= sctp_crc_tableil8_o40[0];
+		crc ^= sctp_crc_tableil8_o32[0];
+#else
+		term1 = sctp_crc_tableil8_o56[0] ^
+			sctp_crc_tableil8_o48[0];
+
+		term2 = 0;
+		crc = crc ^
+		    term1 ^
+		    sctp_crc_tableil8_o40[term2 & 0x000000FF] ^
+		    sctp_crc_tableil8_o32[(term2 >> 8) & 0x000000FF];
+#endif
+	}
+	for (li = 0; li < end_bytes; li++)
+		crc = sctp_crc_tableil8_o32[crc & 0x000000FF] ^
 		    (crc >> 8);
 	return crc;
 }
@@ -606,7 +655,10 @@ update_crc32(uint32_t crc32c,
 		return (crc32c);
 	}
 	offset = ((uintptr_t) buffer) & 0x3;
-	return (sctp_crc32c_sb8_64_bit(crc32c, buffer, length, offset));
+	if (buffer)
+		return (sctp_crc32c_sb8_64_bit(crc32c, buffer, length, offset));
+	else
+		return (sctp_crc32c_sb8_64_bit_zero(crc32c, length, offset));
 }
 
 uint32_t sctp_crc_c[256] = {
@@ -728,7 +780,7 @@ sctp_csum_finalize(uint32_t crc32c)
 }
 #endif
 
-uint32_t ceph_crc32c_le(uint32_t crc, unsigned char const *data, unsigned length)
+uint32_t ceph_crc32c_sctp(uint32_t crc, unsigned char const *data, unsigned length)
 {
 	return update_crc32(crc, data, length);
 }

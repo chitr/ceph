@@ -13,140 +13,60 @@
 
 #ifndef OPREQUEST_H_
 #define OPREQUEST_H_
-#include <sstream>
-#include <stdint.h>
-#include <vector>
 
-#include <include/utime.h>
-#include "common/Mutex.h"
-#include "include/xlist.h"
-#include "msg/Message.h"
-#include <tr1/memory>
-#include "common/TrackedOp.h"
+#include "osd/osd_op_util.h"
 #include "osd/osd_types.h"
-
-class OpRequest;
-typedef std::tr1::shared_ptr<OpRequest> OpRequestRef;
-class OpHistory {
-  set<pair<utime_t, OpRequestRef> > arrived;
-  set<pair<double, OpRequestRef> > duration;
-  void cleanup(utime_t now);
-  bool shutdown;
-
-public:
-  OpHistory() : shutdown(false) {}
-  ~OpHistory() {
-    assert(arrived.empty());
-    assert(duration.empty());
-  }
-  void insert(utime_t now, OpRequestRef op);
-  void dump_ops(utime_t now, Formatter *f);
-  void on_shutdown();
-};
-
-class OpTracker {
-  class RemoveOnDelete {
-    OpTracker *tracker;
-  public:
-    RemoveOnDelete(OpTracker *tracker) : tracker(tracker) {}
-    void operator()(OpRequest *op);
-  };
-  friend class RemoveOnDelete;
-  uint64_t seq;
-  Mutex ops_in_flight_lock;
-  xlist<OpRequest *> ops_in_flight;
-  OpHistory history;
-
-public:
-  OpTracker() : seq(0), ops_in_flight_lock("OpTracker mutex") {}
-  void dump_ops_in_flight(std::ostream& ss);
-  void dump_historic_ops(std::ostream& ss);
-  void register_inflight_op(xlist<OpRequest*>::item *i);
-  void unregister_inflight_op(OpRequest *i);
-
-  /**
-   * Look for Ops which are too old, and insert warning
-   * strings for each Op that is too old.
-   *
-   * @param warning_strings A vector<string> reference which is filled
-   * with a warning string for each old Op.
-   * @return True if there are any Ops to warn on, false otherwise.
-   */
-  bool check_ops_in_flight(std::vector<string> &warning_strings);
-  void mark_event(OpRequest *op, const string &evt);
-  void _mark_event(OpRequest *op, const string &evt, utime_t now);
-  OpRequestRef create_request(Message *req);
-  void on_shutdown() {
-    Mutex::Locker l(ops_in_flight_lock);
-    history.on_shutdown();
-  }
-  ~OpTracker() {
-    assert(ops_in_flight.empty());
-  }
-};
+#include "common/TrackedOp.h"
+#ifdef HAVE_JAEGER
+#include "common/tracer.h"
+#endif
 
 /**
  * The OpRequest takes in a Message* and takes over a single reference
  * to it, which it puts() when destroyed.
- * OpRequest is itself ref-counted. The expectation is that you get a Message
- * you want to track, create an OpRequest with it, and then pass around that OpRequest
- * the way you used to pass around the Message.
  */
 struct OpRequest : public TrackedOp {
   friend class OpTracker;
-  friend class OpHistory;
-  Message *request;
-  xlist<OpRequest*>::item xitem;
-
-  // rmw flags
-  int rmw_flags;
-
-  bool check_rmw(int flag) {
-    return rmw_flags & flag;
-  }
-  bool may_read() { return need_read_cap() || need_class_read_cap(); }
-  bool may_write() { return need_write_cap() || need_class_write_cap(); }
-  bool includes_pg_op() { return check_rmw(CEPH_OSD_RMW_FLAG_PGOP); }
-  bool need_read_cap() {
-    return check_rmw(CEPH_OSD_RMW_FLAG_READ);
-  }
-  bool need_write_cap() {
-    return check_rmw(CEPH_OSD_RMW_FLAG_WRITE);
-  }
-  bool need_class_read_cap() {
-    return check_rmw(CEPH_OSD_RMW_FLAG_CLASS_READ);
-  }
-  bool need_class_write_cap() {
-    return check_rmw(CEPH_OSD_RMW_FLAG_CLASS_WRITE);
-  }
-  void set_read() { rmw_flags |= CEPH_OSD_RMW_FLAG_READ; }
-  void set_write() { rmw_flags |= CEPH_OSD_RMW_FLAG_WRITE; }
-  void set_class_read() { rmw_flags |= CEPH_OSD_RMW_FLAG_CLASS_READ; }
-  void set_class_write() { rmw_flags |= CEPH_OSD_RMW_FLAG_CLASS_WRITE; }
-  void set_pg_op() { rmw_flags |= CEPH_OSD_RMW_FLAG_PGOP; }
-
-  utime_t received_time;
-  uint8_t warn_interval_multiplier;
-  utime_t get_arrived() const {
-    return received_time;
-  }
-  double get_duration() const {
-    return events.size() ?
-      (events.rbegin()->first - received_time) :
-      0.0;
-  }
-
-  void dump(utime_t now, Formatter *f) const;
 
 private:
-  list<pair<utime_t, string> > events;
-  string current;
-  Mutex lock;
-  OpTracker *tracker;
+  OpInfo op_info;
+
+public:
+  int maybe_init_op_info(const OSDMap &osdmap);
+
+  auto get_flags() const { return op_info.get_flags(); }
+  bool op_info_needs_init() const { return op_info.get_flags() == 0; }
+  bool check_rmw(int flag) const { return op_info.check_rmw(flag); }
+  bool may_read() const { return op_info.may_read(); }
+  bool may_write() const { return op_info.may_write(); }
+  bool may_cache() const { return op_info.may_cache(); }
+  bool rwordered_forced() const { return op_info.rwordered_forced(); }
+  bool rwordered() const { return op_info.rwordered(); }
+  bool includes_pg_op() const { return op_info.includes_pg_op(); }
+  bool need_read_cap() const { return op_info.need_read_cap(); }
+  bool need_write_cap() const { return op_info.need_write_cap(); }
+  bool need_promote() const { return op_info.need_promote(); }
+  bool need_skip_handle_cache() const { return op_info.need_skip_handle_cache(); }
+  bool need_skip_promote() const { return op_info.need_skip_promote(); }
+  bool allows_returnvec() const { return op_info.allows_returnvec(); }
+
+  std::vector<OpInfo::ClassInfo> classes() const {
+    return op_info.get_classes();
+  }
+
+  void _dump(ceph::Formatter *f) const override;
+
+  bool has_feature(uint64_t f) const {
+    return request->get_connection()->has_feature(f);
+  }
+
+private:
+  Message *request; /// the logical request we are tracking
   osd_reqid_t reqid;
+  entity_inst_t req_src_inst;
   uint8_t hit_flag_points;
   uint8_t latest_flag_point;
-  uint64_t seq;
+  utime_t dequeued_time;
   static const uint8_t flag_queued_for_pg=1 << 0;
   static const uint8_t flag_reached_pg =  1 << 1;
   static const uint8_t flag_delayed =     1 << 2;
@@ -154,37 +74,49 @@ private:
   static const uint8_t flag_sub_op_sent = 1 << 4;
   static const uint8_t flag_commit_sent = 1 << 5;
 
-  OpRequest(Message *req, OpTracker *tracker) :
-    request(req), xitem(this),
-    rmw_flags(0),
-    warn_interval_multiplier(1),
-    lock("OpRequest::lock"),
-    tracker(tracker),
-    hit_flag_points(0), latest_flag_point(0),
-    seq(0) {
-    received_time = request->get_recv_stamp();
-    tracker->register_inflight_op(&xitem);
-  }
+  OpRequest(Message *req, OpTracker *tracker);
+
+protected:
+  void _dump_op_descriptor_unlocked(std::ostream& stream) const override;
+  void _unregistered() override;
+  bool filter_out(const std::set<std::string>& filters) override;
+
 public:
-  ~OpRequest() {
-    assert(request);
+  ~OpRequest() override {
     request->put();
   }
 
-  bool been_queued_for_pg() { return hit_flag_points & flag_queued_for_pg; }
-  bool been_reached_pg() { return hit_flag_points & flag_reached_pg; }
-  bool been_delayed() { return hit_flag_points & flag_delayed; }
-  bool been_started() { return hit_flag_points & flag_started; }
-  bool been_sub_op_sent() { return hit_flag_points & flag_sub_op_sent; }
-  bool been_commit_sent() { return hit_flag_points & flag_commit_sent; }
-  bool currently_queued_for_pg() { return latest_flag_point & flag_queued_for_pg; }
-  bool currently_reached_pg() { return latest_flag_point & flag_reached_pg; }
-  bool currently_delayed() { return latest_flag_point & flag_delayed; }
-  bool currently_started() { return latest_flag_point & flag_started; }
-  bool currently_sub_op_sent() { return latest_flag_point & flag_sub_op_sent; }
-  bool currently_commit_sent() { return latest_flag_point & flag_commit_sent; }
+  bool check_send_map = true; ///< true until we check if sender needs a map
+  epoch_t sent_epoch = 0;     ///< client's map epoch
+  epoch_t min_epoch = 0;      ///< min epoch needed to handle this msg
 
-  const char *state_string() const {
+  bool hitset_inserted;
+#ifdef HAVE_JAEGER
+  jspan osd_parent_span = nullptr;
+  void set_osd_parent_span(jspan& span) {
+    if(osd_parent_span){
+      jaeger_tracing::finish_span(osd_parent_span);
+    }
+    osd_parent_span = move(span);
+  }
+#else
+  void set_osd_parent_span(...) {}
+#endif
+  template<class T>
+  const T* get_req() const { return static_cast<const T*>(request); }
+
+  const Message *get_req() const { return request; }
+  Message *get_nonconst_req() { return request; }
+
+  entity_name_t get_source() {
+    if (request) {
+      return request->get_source();
+    } else {
+      return entity_name_t();
+    }
+  }
+
+  std::string_view state_string() const override {
     switch(latest_flag_point) {
     case flag_queued_for_pg: return "queued for pg";
     case flag_reached_pg: return "reached pg";
@@ -198,46 +130,42 @@ public:
   }
 
   void mark_queued_for_pg() {
-    mark_event("queued_for_pg");
-    current = "queued for pg";
-    hit_flag_points |= flag_queued_for_pg;
-    latest_flag_point = flag_queued_for_pg;
+    mark_flag_point(flag_queued_for_pg, "queued_for_pg");
   }
   void mark_reached_pg() {
-    mark_event("reached_pg");
-    current = "reached pg";
-    hit_flag_points |= flag_reached_pg;
-    latest_flag_point = flag_reached_pg;
+    mark_flag_point(flag_reached_pg, "reached_pg");
   }
-  void mark_delayed(string s) {
-    mark_event(s);
-    current = s;
-    hit_flag_points |= flag_delayed;
-    latest_flag_point = flag_delayed;
+  void mark_delayed(const std::string& s) {
+    mark_flag_point_string(flag_delayed, s);
   }
   void mark_started() {
-    mark_event("started");
-    current = "started";
-    hit_flag_points |= flag_started;
-    latest_flag_point = flag_started;
+    mark_flag_point(flag_started, "started");
   }
-  void mark_sub_op_sent(string s) {
-    mark_event(s);
-    current = s;
-    hit_flag_points |= flag_sub_op_sent;
-    latest_flag_point = flag_sub_op_sent;
+  void mark_sub_op_sent(const std::string& s) {
+    mark_flag_point_string(flag_sub_op_sent, s);
   }
   void mark_commit_sent() {
-    mark_event("commit_sent");
-    current = "commit sent";
-    hit_flag_points |= flag_commit_sent;
-    latest_flag_point = flag_commit_sent;
+    mark_flag_point(flag_commit_sent, "commit_sent");
   }
 
-  void mark_event(const string &event);
+  utime_t get_dequeued_time() const {
+    return dequeued_time;
+  }
+  void set_dequeued_time(utime_t deq_time) {
+    dequeued_time = deq_time;
+  }
+
   osd_reqid_t get_reqid() const {
     return reqid;
   }
+
+  typedef boost::intrusive_ptr<OpRequest> Ref;
+
+private:
+  void mark_flag_point(uint8_t flag, const char *s);
+  void mark_flag_point_string(uint8_t flag, const std::string& s);
 };
+
+typedef OpRequest::Ref OpRequestRef;
 
 #endif /* OPREQUEST_H_ */

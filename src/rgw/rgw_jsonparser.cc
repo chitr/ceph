@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab ft=cpp
+
 #include <errno.h>
 #include <string.h>
 
@@ -13,7 +16,6 @@
 
 #define dout_subsys ceph_subsys_rgw
 
-using namespace std;
 
 void dump_array(JSONObj *obj)
 {
@@ -112,8 +114,8 @@ int main(int argc, char **argv) {
 
   try {
     ui.decode_json(&parser);
-  } catch (JSONDecoder::err& e) {
-    cout << "failed to decode JSON input: " << e.message << std::endl;
+  } catch (const JSONDecoder::err& e) {
+    cout << "failed to decode JSON input: " << e.what() << std::endl;
     exit(1);
   }
 

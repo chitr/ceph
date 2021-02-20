@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab ft=cpp
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -11,12 +12,13 @@
  * Foundation. See file COPYING.
  *
  */
+
 #include <string.h>
 
 #include <iostream>
 #include <map>
 
-#include <boost/algorithm/string.hpp> 
+#include <boost/algorithm/string.hpp>
 
 #include "include/types.h"
 #include "common/debug.h"
@@ -25,8 +27,8 @@
 
 #include "rgw_cors.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
-using namespace std;
 
 void RGWCORSRule::dump_origins() {
   unsigned num_origins = allowed_origins.size();
@@ -50,6 +52,33 @@ void RGWCORSRule::erase_origin_if_present(string& origin, bool *rule_empty) {
     *rule_empty = (allowed_origins.empty());
   }
 }
+
+/*
+ * make attrs look-like-this
+ * does not convert underscores or dashes
+ *
+ * Per CORS specification, section 3:
+ * ===
+ * "Converting a string to ASCII lowercase" means replacing all characters in the
+ * range U+0041 LATIN CAPITAL LETTER A to U+005A LATIN CAPITAL LETTER Z with
+ * the corresponding characters in the range U+0061 LATIN SMALL LETTER A to
+ * U+007A LATIN SMALL LETTER Z).
+ * ===
+ *
+ * @todo When UTF-8 is allowed in HTTP headers, this function will need to change
+ */
+string lowercase_http_attr(const string& orig)
+{
+  const char *s = orig.c_str();
+  char buf[orig.size() + 1];
+  buf[orig.size()] = '\0';
+
+  for (size_t i = 0; i < orig.size(); ++i, ++s) {
+	buf[i] = tolower(*s);
+  }
+  return string(buf);
+}
+
 
 static bool is_string_in_set(set<string>& s, string h) {
   if ((s.find("*") != s.end()) || 
@@ -77,12 +106,23 @@ static bool is_string_in_set(set<string>& s, string h) {
         string sl = ssplit.front();
         dout(10) << "Finding " << sl << ", in " << h 
           << ", at offset not less than " << flen << dendl;
-        if (h.compare((h.size() - sl.size()), sl.size(), sl) != 0)
+        if (h.size() < sl.size() ||
+	    h.compare((h.size() - sl.size()), sl.size(), sl) != 0)
           continue;
+        ssplit.pop_front();
       }
+      if (!ssplit.empty())
+        continue;
       return true;
     }
   }
+  return false;
+}
+
+bool RGWCORSRule::has_wildcard_origin() {
+  if (allowed_origins.find("*") != allowed_origins.end())
+    return true;
+
   return false;
 }
 
@@ -93,16 +133,23 @@ bool RGWCORSRule::is_origin_present(const char *o) {
 
 bool RGWCORSRule::is_header_allowed(const char *h, size_t len) {
   string hdr(h, len);
-  return is_string_in_set(allowed_hdrs, hdr);
+  if(lowercase_allowed_hdrs.empty()) {
+    set<string>::iterator iter;
+    for (iter = allowed_hdrs.begin(); iter != allowed_hdrs.end(); ++iter) {
+      lowercase_allowed_hdrs.insert(lowercase_http_attr(*iter));
+    }
+  }
+  return is_string_in_set(lowercase_allowed_hdrs, lowercase_http_attr(hdr));
 }
 
 void RGWCORSRule::format_exp_headers(string& s) {
   s = "";
-  for(list<string>::iterator it = exposable_hdrs.begin();
-      it != exposable_hdrs.end(); ++it) {
-      if (s.length() > 0)
-        s.append(",");
-      s.append((*it));
+  for (const auto& header : exposable_hdrs) {
+    if (s.length() > 0)
+      s.append(",");
+    // these values are sent to clients in a 'Access-Control-Expose-Headers'
+    // response header, so we escape '\n' to avoid header injection
+    boost::replace_all_copy(std::back_inserter(s), header, "\n", "\\n");
   }
 }
 

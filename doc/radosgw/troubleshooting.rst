@@ -3,6 +3,27 @@
 =================
 
 
+The Gateway Won't Start
+=======================
+
+If you cannot start the gateway (i.e., there is no existing ``pid``), 
+check to see if there is an existing ``.asok`` file from another 
+user. If an ``.asok`` file from another user exists and there is no
+running ``pid``, remove the ``.asok`` file and try to start the
+process again. This may occur when you start the process as a ``root`` user and 
+the startup script is trying to start the process as a 
+``www-data`` or ``apache`` user and an existing ``.asok`` is 
+preventing the script from starting the daemon.
+
+The radosgw init script (/etc/init.d/radosgw) also has a verbose argument that
+can provide some insight as to what could be the issue::
+
+  /etc/init.d/radosgw start -v
+
+or ::
+
+  /etc/init.d radosgw start --verbose
+
 HTTP Request Errors
 ===================
 
@@ -33,7 +54,7 @@ some insight into the internal state of the ``radosgw`` daemon via
 its admin socket.  By default, there will be a socket configured to
 reside in ``/var/run/ceph``, and the daemon can be queried with::
 
- ceph --admin-daemon /var/run/ceph/client.rgw help
+ ceph daemon /var/run/ceph/client.rgw help
  
  help                list available commands
  objecter_requests   show in-progress osd requests
@@ -43,12 +64,12 @@ reside in ``/var/run/ceph``, and the daemon can be queried with::
 
 Of particular interest::
 
- ceph --admin-daemon /var/run/ceph/client.rgw objecter_requests
+ ceph daemon /var/run/ceph/client.rgw objecter_requests
  ...
 
 will dump information about current in-progress requests with the
 RADOS cluster.  This allows one to identify if any requests are blocked
-by a non-responsive ceph-osd.  For example, one might see::
+by a non-responsive OSD.  For example, one might see::
 
   { "ops": [
         { "tid": 1858,
@@ -91,7 +112,7 @@ check the OSD status with::
 
 This tells us to look at ``osd.1``, the primary copy for this PG::
 
- ceph --admin-daemon /var/run/ceph/osd.1.asok
+ ceph daemon osd.1 ops
  { "num_ops": 651,
   "ops": [
         { "description": "osd_op(client.4124.0:1858 fatty_25647_object1857 [write 0~4096] 2.d2041a48)",
@@ -103,4 +124,85 @@ This tells us to look at ``osd.1``, the primary copy for this PG::
  ...
 
 The ``flag_point`` field indicates that the OSD is currently waiting
-for replicas to respond, in this case ``osd.0``.  
+for replicas to respond, in this case ``osd.0``.
+
+
+Java S3 API Troubleshooting
+===========================
+
+
+Peer Not Authenticated
+----------------------
+
+You may receive an error that looks like this:: 
+
+     [java] INFO: Unable to execute HTTP request: peer not authenticated
+
+The Java SDK for S3 requires a valid certificate from a recognized certificate
+authority, because it uses HTTPS by default. If you are just testing the Ceph
+Object Storage services, you can resolve this problem in a few ways:  
+
+#. Prepend the IP address or hostname with ``http://``. For example, change this::
+
+	conn.setEndpoint("myserver");
+
+   To:: 
+
+	conn.setEndpoint("http://myserver")
+
+#. After setting your credentials, add a client configuration and set the 
+   protocol to ``Protocol.HTTP``. :: 
+
+			AWSCredentials credentials = new BasicAWSCredentials(accessKey, secretKey);
+			
+			ClientConfiguration clientConfig = new ClientConfiguration();
+			clientConfig.setProtocol(Protocol.HTTP);
+			
+			AmazonS3 conn = new AmazonS3Client(credentials, clientConfig);
+
+
+
+405 MethodNotAllowed
+--------------------
+
+If you receive an 405 error, check to see if you have the S3 subdomain set up correctly. 
+You will need to have a wild card setting in your DNS record for subdomain functionality
+to work properly.
+
+Also, check to ensure that the default site is disabled. ::
+
+     [java] Exception in thread "main" Status Code: 405, AWS Service: Amazon S3, AWS Request ID: null, AWS Error Code: MethodNotAllowed, AWS Error Message: null, S3 Extended Request ID: null
+  
+  
+  
+Numerous objects in default.rgw.meta pool
+=========================================
+
+Clusters created prior to *jewel* have a metadata archival feature enabled by default, using the ``default.rgw.meta`` pool.
+This archive keeps all old versions of user and bucket metadata, resulting in large numbers of objects in the ``default.rgw.meta`` pool.
+
+Disabling the Metadata Heap
+---------------------------
+
+Users who want to disable this feature going forward should set the ``metadata_heap`` field to an empty string ``""``::
+
+  $ radosgw-admin zone get --rgw-zone=default > zone.json
+  [edit zone.json, setting "metadata_heap": ""]
+  $ radosgw-admin zone set --rgw-zone=default --infile=zone.json
+  $ radosgw-admin period update --commit
+
+This will stop new metadata from being written to the ``default.rgw.meta`` pool, but does not remove any existing objects or pool.
+
+Cleaning the Metadata Heap Pool
+-------------------------------
+
+Clusters created prior to *jewel* normally use ``default.rgw.meta`` only for the metadata archival feature.
+
+However, from *luminous* onwards, radosgw uses :ref:`Pool Namespaces <radosgw-pool-namespaces>` within ``default.rgw.meta`` for an entirely different purpose, that is, to store ``user_keys`` and other critical metadata.
+
+Users should check zone configuration before proceeding any cleanup procedures::
+
+  $ radosgw-admin zone get --rgw-zone=default | grep default.rgw.meta
+  [should not match any strings]
+
+Having confirmed that the pool is not used for any purpose, users may safely delete all objects in the ``default.rgw.meta`` pool, or optionally, delete the entire pool itself.

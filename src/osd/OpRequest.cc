@@ -8,258 +8,163 @@
 #include "common/config.h"
 #include "msg/Message.h"
 #include "messages/MOSDOp.h"
-#include "messages/MOSDSubOp.h"
-#include "include/assert.h"
+#include "messages/MOSDRepOp.h"
+#include "messages/MOSDRepOpReply.h"
+#include "include/ceph_assert.h"
+#include "osd/osd_types.h"
 
-#define dout_subsys ceph_subsys_optracker
-#undef dout_prefix
-#define dout_prefix _prefix(_dout)
+#ifdef WITH_LTTNG
+#define TRACEPOINT_DEFINE
+#define TRACEPOINT_PROBE_DYNAMIC_LINKAGE
+#include "tracing/oprequest.h"
+#undef TRACEPOINT_PROBE_DYNAMIC_LINKAGE
+#undef TRACEPOINT_DEFINE
+#else
+#define tracepoint(...)
+#endif
 
-static ostream& _prefix(std::ostream* _dout)
-{
-  return *_dout << "--OSD::tracker-- ";
-}
+using std::ostream;
+using std::set;
+using std::string;
+using std::stringstream;
 
-void OpHistory::on_shutdown()
-{
-  arrived.clear();
-  duration.clear();
-  shutdown = true;
-}
+using ceph::Formatter;
 
-void OpHistory::insert(utime_t now, OpRequestRef op)
-{
-  if (shutdown)
-    return;
-  duration.insert(make_pair(op->get_duration(), op));
-  arrived.insert(make_pair(op->get_arrived(), op));
-  cleanup(now);
-}
-
-void OpHistory::cleanup(utime_t now)
-{
-  while (arrived.size() &&
-	 (now - arrived.begin()->first >
-	  (double)(g_conf->osd_op_history_duration))) {
-    duration.erase(make_pair(
-	arrived.begin()->second->get_duration(),
-	arrived.begin()->second));
-    arrived.erase(arrived.begin());
+OpRequest::OpRequest(Message* req, OpTracker* tracker)
+    : TrackedOp(tracker, req->get_throttle_stamp()),
+      request(req),
+      hit_flag_points(0),
+      latest_flag_point(0),
+      hitset_inserted(false) {
+  if (req->get_priority() < tracker->cct->_conf->osd_client_op_priority) {
+    // don't warn as quickly for low priority ops
+    warn_interval_multiplier = tracker->cct->_conf->osd_recovery_op_warn_multiple;
   }
-
-  while (duration.size() > g_conf->osd_op_history_size) {
-    arrived.erase(make_pair(
-	duration.begin()->second->get_arrived(),
-	duration.begin()->second));
-    duration.erase(duration.begin());
+  if (req->get_type() == CEPH_MSG_OSD_OP) {
+    reqid = static_cast<MOSDOp*>(req)->get_reqid();
+  } else if (req->get_type() == MSG_OSD_REPOP) {
+    reqid = static_cast<MOSDRepOp*>(req)->reqid;
+  } else if (req->get_type() == MSG_OSD_REPOPREPLY) {
+    reqid = static_cast<MOSDRepOpReply*>(req)->reqid;
   }
+  req_src_inst = req->get_source_inst();
 }
 
-void OpHistory::dump_ops(utime_t now, Formatter *f)
-{
-  cleanup(now);
-  f->open_object_section("OpHistory");
-  f->dump_int("num to keep", g_conf->osd_op_history_size);
-  f->dump_int("duration to keep", g_conf->osd_op_history_duration);
-  {
-    f->open_array_section("Ops");
-    for (set<pair<utime_t, OpRequestRef> >::const_iterator i =
-	   arrived.begin();
-	 i != arrived.end();
-	 ++i) {
-      f->open_object_section("Op");
-      i->second->dump(now, f);
-      f->close_section();
-    }
-    f->close_section();
-  }
-  f->close_section();
-}
-
-void OpTracker::dump_historic_ops(ostream &ss)
-{
-  JSONFormatter jf(true);
-  Mutex::Locker locker(ops_in_flight_lock);
-  utime_t now = ceph_clock_now(g_ceph_context);
-  history.dump_ops(now, &jf);
-  jf.flush(ss);
-}
-
-void OpTracker::dump_ops_in_flight(ostream &ss)
-{
-  JSONFormatter jf(true);
-  Mutex::Locker locker(ops_in_flight_lock);
-  jf.open_object_section("ops_in_flight"); // overall dump
-  jf.dump_int("num_ops", ops_in_flight.size());
-  jf.open_array_section("ops"); // list of OpRequests
-  utime_t now = ceph_clock_now(g_ceph_context);
-  for (xlist<OpRequest*>::iterator p = ops_in_flight.begin(); !p.end(); ++p) {
-    jf.open_object_section("op");
-    (*p)->dump(now, &jf);
-    jf.close_section(); // this OpRequest
-  }
-  jf.close_section(); // list of OpRequests
-  jf.close_section(); // overall dump
-  jf.flush(ss);
-}
-
-void OpTracker::register_inflight_op(xlist<OpRequest*>::item *i)
-{
-  Mutex::Locker locker(ops_in_flight_lock);
-  ops_in_flight.push_back(i);
-  ops_in_flight.back()->seq = seq++;
-}
-
-void OpTracker::unregister_inflight_op(OpRequest *i)
-{
-  Mutex::Locker locker(ops_in_flight_lock);
-  assert(i->xitem.get_list() == &ops_in_flight);
-  utime_t now = ceph_clock_now(g_ceph_context);
-  i->xitem.remove_myself();
-  i->request->clear_data();
-  history.insert(now, OpRequestRef(i));
-}
-
-bool OpTracker::check_ops_in_flight(std::vector<string> &warning_vector)
-{
-  Mutex::Locker locker(ops_in_flight_lock);
-  if (!ops_in_flight.size())
-    return false;
-
-  utime_t now = ceph_clock_now(g_ceph_context);
-  utime_t too_old = now;
-  too_old -= g_conf->osd_op_complaint_time;
-
-  utime_t oldest_secs = now - ops_in_flight.front()->received_time;
-
-  dout(10) << "ops_in_flight.size: " << ops_in_flight.size()
-           << "; oldest is " << oldest_secs
-           << " seconds old" << dendl;
-
-  if (oldest_secs < g_conf->osd_op_complaint_time)
-    return false;
-
-  xlist<OpRequest*>::iterator i = ops_in_flight.begin();
-  warning_vector.reserve(g_conf->osd_op_log_threshold + 1);
-
-  int slow = 0;     // total slow
-  int warned = 0;   // total logged
-  while (!i.end() && (*i)->received_time < too_old) {
-    slow++;
-
-    // exponential backoff of warning intervals
-    if (((*i)->received_time +
-	 (g_conf->osd_op_complaint_time *
-	  (*i)->warn_interval_multiplier)) < now) {
-      // will warn
-      if (warning_vector.empty())
-	warning_vector.push_back("");
-      warned++;
-      if (warned > g_conf->osd_op_log_threshold)
-        break;
-
-      utime_t age = now - (*i)->received_time;
-      stringstream ss;
-      ss << "slow request " << age << " seconds old, received at " << (*i)->received_time
-	 << ": " << *((*i)->request) << " currently "
-	 << ((*i)->current.size() ? (*i)->current : (*i)->state_string());
-      warning_vector.push_back(ss.str());
-
-      // only those that have been shown will backoff
-      (*i)->warn_interval_multiplier *= 2;
-    }
-    ++i;
-  }
-
-  // only summarize if we warn about any.  if everything has backed
-  // off, we will stay silent.
-  if (warned > 0) {
-    stringstream ss;
-    ss << slow << " slow requests, " << warned << " included below; oldest blocked for > "
-       << oldest_secs << " secs";
-    warning_vector[0] = ss.str();
-  }
-
-  return warning_vector.size();
-}
-
-void OpRequest::dump(utime_t now, Formatter *f) const
+void OpRequest::_dump(Formatter *f) const
 {
   Message *m = request;
-  stringstream name;
-  m->print(name);
-  f->dump_string("description", name.str().c_str()); // this OpRequest
-  f->dump_unsigned("rmw_flags", rmw_flags);
-  f->dump_stream("received_at") << received_time;
-  f->dump_float("age", now - received_time);
-  f->dump_float("duration", get_duration());
   f->dump_string("flag_point", state_string());
   if (m->get_orig_source().is_client()) {
     f->open_object_section("client_info");
-    stringstream client_name;
-    client_name << m->get_orig_source();
+    stringstream client_name, client_addr;
+    client_name << req_src_inst.name;
+    client_addr << req_src_inst.addr;
     f->dump_string("client", client_name.str());
-    f->dump_int("tid", m->get_tid());
+    f->dump_string("client_addr", client_addr.str());
+    f->dump_unsigned("tid", m->get_tid());
     f->close_section(); // client_info
   }
+
   {
     f->open_array_section("events");
-    for (list<pair<utime_t, string> >::const_iterator i = events.begin();
-	 i != events.end();
-	 ++i) {
+    std::lock_guard l(lock);
+
+    for (auto i = events.begin(); i != events.end(); ++i) {
       f->open_object_section("event");
-      f->dump_stream("time") << i->first;
-      f->dump_string("event", i->second);
+      f->dump_string("event", i->str);
+      f->dump_stream("time") << i->stamp;
+
+      auto i_next = i + 1;
+
+      if (i_next < events.end()) {
+	f->dump_float("duration", i_next->stamp - i->stamp);
+      } else {
+	f->dump_float("duration", events.rbegin()->stamp - get_initiated());
+      }
+
       f->close_section();
     }
     f->close_section();
   }
 }
 
-void OpTracker::mark_event(OpRequest *op, const string &dest)
+void OpRequest::_dump_op_descriptor_unlocked(ostream& stream) const
 {
-  utime_t now = ceph_clock_now(g_ceph_context);
-  return _mark_event(op, dest, now);
+  get_req()->print(stream);
 }
 
-void OpTracker::_mark_event(OpRequest *op, const string &evt,
-			    utime_t time)
-{
-  Mutex::Locker locker(ops_in_flight_lock);
-  dout(5) << "reqid: " << op->get_reqid() << ", seq: " << op->seq
-	  << ", time: " << time << ", event: " << evt
-	  << ", request: " << *op->request << dendl;
+void OpRequest::_unregistered() {
+  request->clear_data();
+  request->clear_payload();
+  request->release_message_throttle();
+  request->set_connection(nullptr);
 }
 
-void OpTracker::RemoveOnDelete::operator()(OpRequest *op) {
-  op->mark_event("done");
-  tracker->unregister_inflight_op(op);
-  // Do not delete op, unregister_inflight_op took control
+int OpRequest::maybe_init_op_info(const OSDMap &osdmap) {
+  if (op_info.get_flags())
+    return 0;
+
+  auto m = get_req<MOSDOp>();
+
+#ifdef WITH_LTTNG
+  auto old_rmw_flags = op_info.get_flags();
+#endif
+  auto ret = op_info.set_from_op(m, osdmap);
+  tracepoint(oprequest, set_rmw_flags, reqid.name._type,
+	     reqid.name._num, reqid.tid, reqid.inc,
+	     op_info.get_flags(), old_rmw_flags, op_info.get_flags());
+  return ret;
 }
 
-OpRequestRef OpTracker::create_request(Message *ref)
-{
-  OpRequestRef retval(new OpRequest(ref, this),
-		      RemoveOnDelete(this));
+void OpRequest::mark_flag_point(uint8_t flag, const char *s) {
+#ifdef WITH_LTTNG
+  uint8_t old_flags = hit_flag_points;
+#endif
+  mark_event(s);
+  hit_flag_points |= flag;
+  latest_flag_point = flag;
+  tracepoint(oprequest, mark_flag_point, reqid.name._type,
+	     reqid.name._num, reqid.tid, reqid.inc, op_info.get_flags(),
+	     flag, s, old_flags, hit_flag_points);
+}
 
-  if (ref->get_type() == CEPH_MSG_OSD_OP) {
-    retval->reqid = static_cast<MOSDOp*>(ref)->get_reqid();
-  } else if (ref->get_type() == MSG_OSD_SUBOP) {
-    retval->reqid = static_cast<MOSDSubOp*>(ref)->reqid;
+void OpRequest::mark_flag_point_string(uint8_t flag, const string& s) {
+#ifdef WITH_LTTNG
+  uint8_t old_flags = hit_flag_points;
+#endif
+  mark_event(s);
+  hit_flag_points |= flag;
+  latest_flag_point = flag;
+  tracepoint(oprequest, mark_flag_point, reqid.name._type,
+	     reqid.name._num, reqid.tid, reqid.inc, op_info.get_flags(),
+	     flag, s.c_str(), old_flags, hit_flag_points);
+}
+
+bool OpRequest::filter_out(const set<string>& filters)
+{
+  set<entity_addr_t> addrs;
+  for (auto it = filters.begin(); it != filters.end(); it++) {
+    entity_addr_t addr;
+    if (addr.parse((*it).c_str())) {
+      addrs.insert(addr);
+    }
   }
-  _mark_event(retval.get(), "header_read", ref->get_recv_stamp());
-  _mark_event(retval.get(), "throttled", ref->get_throttle_stamp());
-  _mark_event(retval.get(), "all_read", ref->get_recv_complete_stamp());
-  _mark_event(retval.get(), "dispatched", ref->get_dispatch_stamp());
-  return retval;
+  if (addrs.empty())
+    return true;
+
+  entity_addr_t cmp_addr = req_src_inst.addr;
+  if (addrs.count(cmp_addr)) {
+    return true;
+  }
+  cmp_addr.set_nonce(0);
+  if (addrs.count(cmp_addr)) {
+    return true;
+  }
+  cmp_addr.set_port(0);
+  if (addrs.count(cmp_addr)) {
+    return true;
+  }
+
+  return false;
 }
 
-void OpRequest::mark_event(const string &event)
-{
-  utime_t now = ceph_clock_now(g_ceph_context);
-  {
-    Mutex::Locker l(lock);
-    events.push_back(make_pair(now, event));
-  }
-  tracker->mark_event(this, event);
-}

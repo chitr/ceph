@@ -7,7 +7,6 @@
  *          Kalpak Shah <kalpak.shah@sun.com>
  *          Andreas Dilger <adilger@sun.com>
  */
-
 #ifndef _LINUX_FIEMAP_H
 #define _LINUX_FIEMAP_H
 
@@ -15,8 +14,9 @@
 #include <linux/types.h>
 #elif defined(__FreeBSD_)
 #include <sys/types.h>
-#include "include/inttypes.h"
 #endif
+
+#include "include/int_types.h"
 
 struct fiemap_extent {
 	__u64 fe_logical;  /* logical offset in bytes for the start of
